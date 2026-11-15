@@ -31,7 +31,10 @@ router = APIRouter(prefix="/api", tags=["batches"])
 @router.post("/batches", response_model=BatchOut)
 def api_create_batch(body: BatchCreateRequest, session: Session = Depends(get_db),
                      user: User = Depends(get_current_user)):
-    batch = jobs.create_batch(session, user.id, body.model_dump())
+    try:
+        batch = jobs.create_batch(session, user.id, body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(422, str(exc))
     session.flush()
     return batch
 

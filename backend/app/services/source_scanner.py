@@ -64,23 +64,35 @@ class ScanResult:
     notes: list[str] = field(default_factory=list)
 
 
-def _fetch_page(url: str, timeout: float = 30.0) -> str:
+def _fetch_page(url: str, timeout: float = 30.0, max_redirects: int = 5) -> str:
     headers = {
         "User-Agent": "ArcusClips/1.0 (self-hosted video clipping studio; +local)",
         "Accept": "text/html,application/xhtml+xml",
     }
-    try:
-        resp = httpx.get(url, headers=headers, follow_redirects=True, timeout=timeout)
-    except httpx.HTTPError as exc:
-        raise ScanError(f"Could not fetch {url}: {exc}") from exc
-    if resp.status_code >= 400:
-        raise ScanError(f"HTTP {resp.status_code} fetching {url}")
-    ctype = resp.headers.get("content-type", "")
-    if "html" not in ctype and "text" not in ctype:
-        # non-HTML resource: only accept if it looks like a video
-        if not _is_video_url(url):
-            raise ScanError(f"Unsupported content type {ctype} at {url}")
-    return resp.text
+    # Follow redirects manually so every hop is SSRF-validated before fetch.
+    current = url
+    for _ in range(max_redirects + 1):
+        try:
+            resp = httpx.get(current, headers=headers, follow_redirects=False, timeout=timeout)
+        except httpx.HTTPError as exc:
+            raise ScanError(f"Could not fetch {current}: {exc}") from exc
+        if resp.status_code in (301, 302, 303, 307, 308):
+            location = resp.headers.get("location", "")
+            if not location:
+                raise ScanError(f"Redirect from {current} has no location")
+            current = urljoin(current, location)
+            # SSRF: validate the redirect destination before following it.
+            current = validate_public_url(current, allowed_domains() or None)
+            continue
+        if resp.status_code >= 400:
+            raise ScanError(f"HTTP {resp.status_code} fetching {current}")
+        ctype = resp.headers.get("content-type", "")
+        if "html" not in ctype and "text" not in ctype:
+            # non-HTML resource: only accept if it looks like a video
+            if not _is_video_url(current):
+                raise ScanError(f"Unsupported content type {ctype} at {current}")
+        return resp.text
+    raise ScanError(f"Too many redirects fetching {url}")
 
 
 def _extract_videos_from_html(html: str, base_url: str) -> list[dict[str, Any]]:
@@ -145,6 +157,12 @@ def scan_webpage(
                 if parsed.netloc.lower() != base_domain:
                     continue  # do not leave the configured domain
                 if link.startswith("#") or link.startswith("mailto:"):
+                    continue
+                # SSRF: validate every extracted link before it is fetched.
+                try:
+                    link = validate_public_url(link, allowed_domains() or None)
+                except ValueError as exc:
+                    result.errors.append(f"Skipped unsafe link {link}: {exc}")
                     continue
                 if link not in visited and link not in {q[0] for q in queue}:
                     queue.append((link, d + 1))

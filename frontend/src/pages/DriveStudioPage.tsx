@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, fmtBytes } from "../api";
 import { Card, EmptyState, Spinner, StatusBadge } from "../components/ui";
@@ -23,29 +23,69 @@ export default function DriveStudioPage() {
   const [selected, setSelected] = useState<Selection[]>([]);
   const [scanResult, setScanResult] = useState<{ videos: number; stats: Record<string, number> } | null>(null);
 
+  const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [authError, setAuthError] = useState<string | null>(null);
+
   const connect = useMutation({
     mutationFn: async () => {
+      // Clear any previous auth error when starting a new authorization.
+      setAuthError(null);
+      // Open Google's authorization page synchronously from the user's click
+      // to avoid popup-blocker issues.
       const { auth_url } = await api.driveAuthStart();
-      window.open(auth_url, "_blank", "noopener");
+      window.open(auth_url, "_blank", "noopener,noreferrer");
     },
     onSuccess: () => {
-      const t = setInterval(() => {
-        qc.invalidateQueries({ queryKey: ["drive-status"] }).then(() => {
-          const s = status.data;
+      // Poll the latest refetch result rather than a stale snapshot.
+      const startedAt = Date.now();
+      const timeoutMs = 120_000;
+      if (pollTimer.current) clearInterval(pollTimer.current);
+      pollTimer.current = setInterval(async () => {
+        try {
+          const result = await status.refetch();
+          const s = result.data;
           if (s?.connected) {
-            clearInterval(t);
+            // success — stop polling and refresh roots
+            if (pollTimer.current) {
+              clearInterval(pollTimer.current);
+              pollTimer.current = null;
+            }
             qc.invalidateQueries({ queryKey: ["drive-roots"] });
+            qc.invalidateQueries({ queryKey: ["drive-status"] });
+          } else if (Date.now() - startedAt > timeoutMs) {
+            // timeout — stop polling and surface the error
+            if (pollTimer.current) {
+              clearInterval(pollTimer.current);
+              pollTimer.current = null;
+            }
+            setAuthError("Google Drive authorization did not complete in time. Please try again.");
           }
-        });
+        } catch {
+          // keep polling on transient errors until timeout
+        }
       }, 2000);
-      // best-effort polling guard; cleared on unmount via timeout
-      setTimeout(() => clearInterval(t), 120_000);
     },
   });
 
+  // Clean up the polling timer on unmount.
+  useEffect(() => {
+    return () => {
+      if (pollTimer.current) {
+        clearInterval(pollTimer.current);
+        pollTimer.current = null;
+      }
+    };
+  }, []);
+
   const disconnect = useMutation({
     mutationFn: api.driveDisconnect,
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["drive-status"] }),
+    onSuccess: () => {
+      if (pollTimer.current) {
+        clearInterval(pollTimer.current);
+        pollTimer.current = null;
+      }
+      qc.invalidateQueries({ queryKey: ["drive-status"] });
+    },
   });
 
   const expand = async (folderId: string, name: string, path: string) => {
@@ -97,7 +137,9 @@ export default function DriveStudioPage() {
           <button className="btn-primary" onClick={() => connect.mutate()} disabled={connect.isPending}>
             {connect.isPending ? "Opening authorization…" : "Connect Google Drive"}
           </button>
-          {connect.isError && <div className="text-sm text-danger">{String(connect.error)}</div>}
+          {(connect.isError || authError) && (
+            <div className="text-sm text-danger">{String(connect.error || authError)}</div>
+          )}
           <p className="max-w-md text-xs text-ink-500">
             Read-only access is requested ({`drive.readonly`}). Configure
             <code className="mx-1">ARCUS_GOOGLE_OAUTH_CLIENT_ID</code> /

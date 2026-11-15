@@ -97,6 +97,16 @@ def create_batch(session: Session, user_id: int, options: dict[str, Any]) -> Bat
     if max_sec <= min_sec:
         max_sec = min_sec + 15
 
+    # Server-side validation of batch options (not only the frontend).
+    clips_per_video = int(options.get("clips_per_video", 3))
+    if clips_per_video < 1:
+        raise ValueError("clips_per_video must be at least 1")
+    max_total = int(options.get("max_total_clips", 0) or 0)
+    if max_total < 0:
+        raise ValueError("max_total_clips must be 0 (unlimited) or a positive integer")
+    if min_sec < 1:
+        raise ValueError("duration.min_seconds must be at least 1")
+
     # resolve the video set
     video_ids = [int(v) for v in options.get("video_ids", []) if v]
     source_ids = [int(s) for s in options.get("source_ids", []) if s]
@@ -113,8 +123,8 @@ def create_batch(session: Session, user_id: int, options: dict[str, Any]) -> Bat
     if skip_processed:
         videos = [v for v in videos if v.status != "processed"]
 
-    clips_per_video = int(options.get("clips_per_video", 3))
-    max_total = int(options.get("max_total_clips", 0) or 0)
+    if not videos:
+        raise ValueError("No eligible videos selected for this batch")
 
     name = options.get("name") or f"Batch {datetime.utcnow().strftime('%Y-%m-%d %H:%M')}"
     batch = Batch(
@@ -130,9 +140,24 @@ def create_batch(session: Session, user_id: int, options: dict[str, Any]) -> Bat
     session.add(batch)
     session.flush()
 
+    queued_clips = 0
     for v in videos:
-        if max_total > 0 and (batch.total_videos * clips_per_video) >= max_total:
-            break
+        # max_total_clips limits the overall number of clips requested. When it
+        # is set, stop queueing once the remaining capacity cannot fit another
+        # full clips_per_video batch. A final partial video is included only if
+        # it fits within the remaining capacity (handles non-even divisions).
+        if max_total > 0:
+            remaining = max_total - queued_clips
+            if remaining <= 0:
+                break
+            if remaining < clips_per_video:
+                # Only the remaining capacity is requested from this video.
+                clips_for_this = remaining
+            else:
+                clips_for_this = clips_per_video
+        else:
+            clips_for_this = clips_per_video
+
         session.add(Job(
             user_id=user_id,
             batch_id=batch.id,
@@ -142,8 +167,9 @@ def create_batch(session: Session, user_id: int, options: dict[str, Any]) -> Bat
             status="pending",
             stage="queued",
             progress=0.0,
-            payload={"clips_per_video": clips_per_video},
+            payload={"clips_per_video": clips_for_this},
         ))
+        queued_clips += clips_for_this
     session.flush()
     compute_batch_status(session, batch)
     log_event(session, user_id, "info", f"Batch '{name}' created with {batch.total_videos} videos")

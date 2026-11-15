@@ -152,6 +152,7 @@ def api_ffmpeg_status(user: User = Depends(get_current_user)):
     return {"ffmpeg_version": ffmpeg_engine.ffmpeg_version(),
             "ffmpeg_path": ffmpeg_engine.get_ffmpeg_path(),
             "ffprobe_path": ffmpeg_engine.get_ffprobe_path() or "",
+            "ffprobe": ffmpeg_engine.ffprobe_status(),
             "caption_styles": list(ffmpeg_engine.CAPTION_STYLES),
             "layouts": list(ffmpeg_engine.LAYOUTS)}
 

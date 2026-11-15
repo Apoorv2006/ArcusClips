@@ -124,6 +124,7 @@ def api_scan_source(source_id: int, session: Session = Depends(get_db),
 def _register_drive_videos(session: Session, user_id: int, conn_id: int,
                            videos: list[dict], source: Source) -> int:
     count = 0
+    source_id = source.id if source is not None else None
     for v in videos:
         df = session.query(DriveFile).filter(
             DriveFile.user_id == user_id, DriveFile.drive_file_id == v["id"]
@@ -145,7 +146,7 @@ def _register_drive_videos(session: Session, user_id: int, conn_id: int,
         ).first()
         if not vid:
             session.add(Video(
-                user_id=user_id, source_id=source.id, drive_file_id=df.id, kind="drive",
+                user_id=user_id, source_id=source_id, drive_file_id=df.id, kind="drive",
                 name=v["name"], folder_path=v.get("relative_path", ""),
                 status="discovered",
             ))
@@ -210,15 +211,38 @@ def api_drive_auth_start(session: Session = Depends(get_db), user: User = Depend
 
 
 @router.get("/drive/auth/callback")
-def api_drive_auth_callback(code: str, state: str, session: Session = Depends(get_db),
-                            user: User = Depends(get_current_user)):
+def api_drive_auth_callback(code: str | None = None, state: str | None = None,
+                            error: str | None = None, session: Session = Depends(get_db)):
+    """Receive Google's OAuth redirect.
+
+    This is a browser redirect and does NOT carry the app's bearer token, so it
+    must not depend on ``get_current_user``. The initiating user is resolved
+    from the validated, one-time OAuth state record — never from a query param.
+    """
     from ..models import OAuthState
 
-    state_row = session.query(OAuthState).filter(OAuthState.state == state, OAuthState.user_id == user.id).first()
+    if error:
+        raise HTTPException(400, f"Google Drive authorization was denied: {error}")
+    if not state:
+        raise HTTPException(400, "Missing OAuth state")
+    if not code:
+        raise HTTPException(400, "Missing authorization code")
+
+    state_row = session.query(OAuthState).filter(OAuthState.state == state).first()
     if not state_row:
         raise HTTPException(400, "Invalid or unknown OAuth state")
     if state_row.used:
         raise HTTPException(400, "OAuth state already used")
+    # enforce a short expiry window
+    age = (utcnow() - state_row.created_at).total_seconds()
+    if age > settings.oauth_state_ttl_seconds:
+        state_row.used = True
+        session.flush()
+        raise HTTPException(400, "OAuth state has expired")
+
+    user = session.get(User, state_row.user_id)
+    if not user:
+        raise HTTPException(400, "OAuth state references a missing user")
     if not drive_google.oauth_configured():
         raise HTTPException(400, "Google OAuth is not configured")
     tokens = drive_google.exchange_code(code)
@@ -234,6 +258,8 @@ def api_drive_auth_callback(code: str, state: str, session: Session = Depends(ge
         conn.last_verified_at = utcnow()
     except Exception as exc:
         conn.status = "expired"
+        state_row.used = True
+        session.flush()
         raise HTTPException(502, f"Drive verification failed: {exc}")
     state_row.used = True
     session.flush()
@@ -293,11 +319,16 @@ def api_drive_scan(body: DriveScanRequest, session: Session = Depends(get_db),
         raise HTTPException(400, "Google Drive is not connected")
     client, _ = drive_google.client_from_connection(conn)
     videos, stats = drive_google.scan_folders(client, body.folder_ids, body.exclude_ids)
-    _register_drive_videos(session, user.id, conn.id, videos, None)
+
+    # Create the Source record BEFORE registering videos so that
+    # _register_drive_videos can reference source.id when creating Video rows.
     source = Source(user_id=user.id, type="drive_folder", name="Drive scan",
                     url_or_id=",".join(body.folder_ids), folder_id=str(conn.id),
                     scan_status="ok", last_scanned_at=utcnow(), discovered_count=len(videos))
     session.add(source)
+    session.flush()
+    registered = _register_drive_videos(session, user.id, conn.id, videos, source)
+    source.discovered_count = registered
     session.flush()
     return {"ok": True, "videos": len(videos), "stats": stats}
 
