@@ -105,6 +105,8 @@ class DriveFile(Base):
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     connection_id: Mapped[int | None] = mapped_column(ForeignKey("drive_connections.id"), nullable=True)
     drive_file_id: Mapped[str] = mapped_column(String(255), index=True)
+    target_id: Mapped[str] = mapped_column(String(255), default="")
+    drive_id: Mapped[str] = mapped_column(String(255), default="")
     name: Mapped[str] = mapped_column(String(255))
     mime_type: Mapped[str] = mapped_column(String(128), default="")
     size: Mapped[int] = mapped_column(Integer, default=0)

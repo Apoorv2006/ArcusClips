@@ -41,10 +41,10 @@ class _FakeFiles:
         next_token = str(start + self.page_size) if start + self.page_size < len(children) else None
         return _FakeRequest({"files": page, "nextPageToken": next_token})
 
-    def get(self, fileId, fields=None):
+    def get(self, fileId, fields=None, **kwargs):
         return _FakeRequest(self.tree[fileId])
 
-    def get_media(self, fileId):
+    def get_media(self, fileId, **kwargs):
         return _FakeMedia(self.tree[fileId])
 
 

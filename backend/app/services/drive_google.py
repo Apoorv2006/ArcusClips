@@ -226,8 +226,14 @@ def _file_entry(f: dict[str, Any]) -> dict[str, Any]:
         "application/vnd.google-apps.shortcut"
     )
     downloadable = can_download and not is_workspace_file
+    # For shortcuts, the media lives at the target ID; normal files use their
+    # own ID. Both are preserved so downloads use the real file ID.
+    target_id = f["id"]
+    if is_shortcut and targets:
+        target_id = targets[0]
     return {
         "id": f["id"],
+        "target_id": target_id,
         "name": f.get("name", ""),
         "mime_type": mime,
         "size": int(f.get("size", 0) or 0),
@@ -297,9 +303,12 @@ def list_children(client, folder_id: str, drive_id: str | None = None) -> list[d
 
 
 def get_file_meta(client, file_id: str, drive_id: str | None = None) -> dict[str, Any]:
-    kwargs: dict[str, Any] = {"fields": _FILE_FIELDS_SINGLE}
+    kwargs: dict[str, Any] = {
+        "fields": _FILE_FIELDS_SINGLE,
+        # Required for Shared Drive files; harmless for My Drive.
+        "supportsAllDrives": True,
+    }
     if drive_id:
-        kwargs["supportsAllDrives"] = True
         kwargs["driveId"] = drive_id
     f = client.files().get(fileId=file_id, **kwargs).execute()
     return _file_entry(f)
@@ -395,8 +404,13 @@ def scan_folders(
                 if resolved["is_video"]:
                     if cid not in videos:
                         video = dict(resolved)
-                        video["id"] = cid  # register under the shortcut id for dedup
+                        # Register under the shortcut ID for dedup/display, but
+                        # keep the real target ID for media downloads.
+                        video["id"] = cid
+                        video["target_id"] = resolved["id"]
                         video["name"] = child["name"] or resolved["name"]
+                        video["is_shortcut"] = True
+                        video["drive_id"] = drive_id
                         video["relative_path"] = "/".join(
                             p for p in ([rel_path, child["name"]] if rel_path else [child["name"]]) if p
                         )
@@ -410,6 +424,9 @@ def scan_folders(
             if is_video_file(child["mime_type"], child["name"]):
                 if cid not in videos:
                     video = dict(child)
+                    # target_id defaults to the file's own id (already in child).
+                    video.setdefault("target_id", cid)
+                    video["drive_id"] = drive_id
                     video["relative_path"] = "/".join(
                         p for p in ([rel_path, child["name"]] if rel_path else [child["name"]]) if p
                     )
@@ -445,12 +462,17 @@ def download_file(
     progress_cb: ProgressCb | None = None,
     max_retries: int = 3,
     cancel_event=None,
+    drive_id: str | None = None,
 ) -> str:
     """Stream a file from Drive to disk using MediaIoBaseDownload.
 
     Writes to a temporary ``.part`` file, retries transient failures with
     bounded exponential backoff, validates size (and MD5 when supplied) and
     only moves the file to its final destination after successful validation.
+
+    ``drive_id`` scopes the request to a Shared Drive (passes ``supportsAllDrives``
+    and ``driveId`` to the media request). The download size limit is enforced
+    while streaming even when the provider does not report the expected size.
     """
     cb = progress_cb or (lambda p, m: None)
     out_path = Path(out_path)
@@ -468,7 +490,8 @@ def download_file(
             tmp_path.unlink(missing_ok=True)
             raise DriveError("Download cancelled")
         try:
-            _media_download(client, file_id, tmp_path, file_size, checksum, cb, cancel_event)
+            _media_download(client, file_id, tmp_path, file_size, checksum, cb,
+                            cancel_event, drive_id=drive_id)
             tmp_path.replace(out_path)
             cb(1.0, "Download complete")
             return str(out_path)
@@ -482,12 +505,22 @@ def download_file(
 
 
 def _media_download(client, file_id: str, out_path: Path, file_size: int,
-                    checksum: str, cb, cancel_event) -> None:
-    """Stream media to ``out_path`` via MediaIoBaseDownload with validation."""
+                    checksum: str, cb, cancel_event, drive_id: str | None = None) -> None:
+    """Stream media to ``out_path`` via MediaIoBaseDownload with validation.
+
+    Enforces ``settings.max_download_size`` during streaming (even when
+    ``file_size`` is unknown/0) and stops immediately on cancellation or when
+    the size limit is exceeded.
+    """
     from googleapiclient.http import MediaIoBaseDownload
 
-    request = client.files().get_media(fileId=file_id)
+    kwargs: dict[str, Any] = {"fileId": file_id, "supportsAllDrives": True}
+    if drive_id:
+        kwargs["driveId"] = drive_id
+    request = client.files().get_media(**kwargs)
     fh = open(out_path, "wb")
+    written = 0
+    max_size = settings.max_download_size
     try:
         downloader = MediaIoBaseDownload(fh, request)
         done = False
@@ -496,9 +529,15 @@ def _media_download(client, file_id: str, out_path: Path, file_size: int,
                 raise DriveError("Download cancelled")
             try:
                 status, done = downloader.next_chunk(num_retries=3)
-            except Exception as exc:
-                raise exc
+            except Exception:
+                raise
             if status:
+                # MediaIoBaseDownload writes to the file handle; track bytes.
+                written = fh.tell()
+                if max_size and written > max_size:
+                    raise DriveError(
+                        f"Download exceeded max size ({written} > {max_size})"
+                    )
                 frac = status.progress()
                 cb(min(0.99, frac), f"{frac * 100:.0f}%")
     finally:
@@ -507,6 +546,8 @@ def _media_download(client, file_id: str, out_path: Path, file_size: int,
     actual_size = out_path.stat().st_size
     if file_size and actual_size != file_size:
         raise DriveError(f"Download size mismatch: got {actual_size}, expected {file_size}")
+    if max_size and actual_size > max_size:
+        raise DriveError(f"Download exceeded max size ({actual_size} > {max_size})")
     if checksum:
         actual_md5 = _md5_file(out_path)
         if actual_md5.lower() != checksum.lower():

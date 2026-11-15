@@ -230,17 +230,33 @@ def ytdlp_extract_info(url: str, progress_cb: ProgressCb = None) -> dict[str, An
         raise ScanError(f"yt-dlp could not resolve this source: {exc}") from exc
     if not info:
         raise ScanError("yt-dlp returned no data for this source")
+    # SSRF: validate every resolved URL before exposing it. yt-dlp may follow
+    # redirects internally; we re-validate the final resolved URLs so private,
+    # loopback and link-local destinations are never returned as importable.
+    def _safe_url(u: str) -> str | None:
+        if not u:
+            return None
+        try:
+            return validate_public_url(u, allowed_domains() or None)
+        except ValueError:
+            return None
+
     if info.get("_type") == "playlist":
         entries = [e for e in info.get("entries", []) if e]
-        items = [
-            {"url": e.get("webpage_url") or e.get("url", ""), "name": e.get("title", ""), "kind": "playlist_item"}
-            for e in entries
-        ]
+        items = []
+        for e in entries:
+            u = _safe_url(e.get("webpage_url") or e.get("url", ""))
+            if not u:
+                continue
+            items.append({"url": u, "name": e.get("title", ""), "kind": "playlist_item"})
         return {"is_playlist": True, "title": info.get("title", ""), "videos": items}
+    safe = _safe_url(info.get("webpage_url") or url)
+    if not safe:
+        raise ScanError("yt-dlp resolved to a non-public/unsafe URL; refusing to import")
     return {
         "is_playlist": False,
         "title": info.get("title", ""),
-        "videos": [{"url": info.get("webpage_url") or url, "name": info.get("title", ""), "kind": "video"}],
+        "videos": [{"url": safe, "name": info.get("title", ""), "kind": "video"}],
     }
 
 

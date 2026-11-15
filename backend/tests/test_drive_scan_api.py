@@ -21,7 +21,7 @@ def connected_drive(client, app_env, monkeypatch):
 
     scanned = {"count": 0}
 
-    def _fake_scan(client, folder_ids, exclude_ids=None, progress_cb=None):
+    def _fake_scan(client, folder_ids, exclude_ids=None, progress_cb=None, drive_id=None):
         scanned["count"] += 1
         videos = [
             {"id": "v1", "name": "a.mp4", "mime_type": "video/mp4", "size": 100,

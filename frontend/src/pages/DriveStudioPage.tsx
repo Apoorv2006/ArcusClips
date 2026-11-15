@@ -24,16 +24,27 @@ export default function DriveStudioPage() {
   const [scanResult, setScanResult] = useState<{ videos: number; stats: Record<string, number> } | null>(null);
 
   const pollTimer = useRef<ReturnType<typeof setInterval> | null>(null);
+  const authPopup = useRef<Window | null>(null);
   const [authError, setAuthError] = useState<string | null>(null);
 
   const connect = useMutation({
     mutationFn: async () => {
       // Clear any previous auth error when starting a new authorization.
       setAuthError(null);
-      // Open Google's authorization page synchronously from the user's click
-      // to avoid popup-blocker issues.
+      // Open a blank popup SYNCHRONOUSLY from the user's click handler, before
+      // any await, so the browser does not treat it as a popup-blocker case.
+      const popup = window.open("", "_blank", "noopener,noreferrer");
+      if (!popup) {
+        setAuthError(
+          "Popup was blocked. Please allow popups for this site and try again."
+        );
+        throw new Error("Popup blocked");
+      }
+      authPopup.current = popup;
+      // Fetch the authorization URL afterward, then navigate the already-open
+      // popup to Google's authorization page.
       const { auth_url } = await api.driveAuthStart();
-      window.open(auth_url, "_blank", "noopener,noreferrer");
+      popup.location.replace(auth_url);
     },
     onSuccess: () => {
       // Poll the latest refetch result rather than a stale snapshot.
@@ -45,11 +56,15 @@ export default function DriveStudioPage() {
           const result = await status.refetch();
           const s = result.data;
           if (s?.connected) {
-            // success — stop polling and refresh roots
+            // success — stop polling, close the auth popup, refresh roots
             if (pollTimer.current) {
               clearInterval(pollTimer.current);
               pollTimer.current = null;
             }
+            if (authPopup.current && !authPopup.current.closed) {
+              authPopup.current.close();
+            }
+            authPopup.current = null;
             qc.invalidateQueries({ queryKey: ["drive-roots"] });
             qc.invalidateQueries({ queryKey: ["drive-status"] });
           } else if (Date.now() - startedAt > timeoutMs) {
@@ -67,13 +82,17 @@ export default function DriveStudioPage() {
     },
   });
 
-  // Clean up the polling timer on unmount.
+  // Clean up the polling timer and any open auth popup on unmount.
   useEffect(() => {
     return () => {
       if (pollTimer.current) {
         clearInterval(pollTimer.current);
         pollTimer.current = null;
       }
+      if (authPopup.current && !authPopup.current.closed) {
+        authPopup.current.close();
+      }
+      authPopup.current = null;
     };
   }, []);
 
@@ -84,6 +103,10 @@ export default function DriveStudioPage() {
         clearInterval(pollTimer.current);
         pollTimer.current = null;
       }
+      if (authPopup.current && !authPopup.current.closed) {
+        authPopup.current.close();
+      }
+      authPopup.current = null;
       qc.invalidateQueries({ queryKey: ["drive-status"] });
     },
   });
@@ -138,7 +161,7 @@ export default function DriveStudioPage() {
             {connect.isPending ? "Opening authorization…" : "Connect Google Drive"}
           </button>
           {(connect.isError || authError) && (
-            <div className="text-sm text-danger">{String(connect.error || authError)}</div>
+            <div className="text-sm text-danger">{String(authError || connect.error)}</div>
           )}
           <p className="max-w-md text-xs text-ink-500">
             Read-only access is requested ({`drive.readonly`}). Configure
