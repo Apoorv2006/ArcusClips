@@ -48,17 +48,54 @@ class _FakeFiles:
         return _FakeMedia(self.tree[fileId])
 
 
-class _FakeMedia:
-    def __init__(self, file_meta):
-        self._data = (file_meta.get("name", "") + "-bytes").encode()
+class _FakeStatus:
+    """Mimics the googleapiclient HttpResponse status used by MediaIoBaseDownload."""
 
-    def next_chunk(self):
-        if not hasattr(self, "_sent"):
-            self._sent = 0
-        if self._sent == 0:
-            self._sent += 1
-            return _FakeChunk(self._data)
-        return None
+    def __init__(self, fraction: float):
+        self._fraction = fraction
+
+    def progress(self) -> float:
+        return self._fraction
+
+
+class _FakeResp:
+    """httplib2-style response with a .status attribute and header access."""
+
+    def __init__(self, status: int, headers: dict):
+        self.status = status
+        self._headers = headers
+
+    def __contains__(self, key):
+        return key in self._headers
+
+    def __getitem__(self, key):
+        return self._headers[key]
+
+    def get(self, key, default=None):
+        return self._headers.get(key, default)
+
+
+class _FakeHttp:
+    """Mimics the httplib2-style http object used by MediaIoBaseDownload."""
+
+    def __init__(self, data: bytes):
+        self._data = data
+
+    def request(self, uri, method="GET", body=None, headers=None, **kwargs):
+        resp = _FakeResp(
+            200,
+            {"content-range": f"bytes 0-{len(self._data) - 1}/{len(self._data)}"},
+        )
+        return resp, self._data
+
+
+class _FakeMedia:
+    """Mimics a googleapiclient media request compatible with MediaIoBaseDownload."""
+
+    def __init__(self, file_meta):
+        self.uri = f"https://example.invalid/{file_meta.get('id', '')}"
+        self.headers = {}
+        self.http = _FakeHttp((file_meta.get("name", "") + "-bytes").encode())
 
 
 class _FakeChunk:
@@ -104,9 +141,11 @@ def drive_tree():
         "f2": _file("f2", "Episode 01", "application/vnd.google-apps.folder", ["f1"]),
         "f3": _file("f3", "Episode 02", "application/vnd.google-apps.folder", ["f1"]),
         "v1": _file("v1", "full_episode.mp4", "video/mp4", ["f2"], size="100",
-                    downloadUrl="https://example.invalid/v1", md5Checksum="abc"),
-        "v2": _file("v2", "camera_02.mov", "video/quicktime", ["f2"], size="200"),
-        "v3": _file("v3", "episode.mp4", "video/mp4", ["f3"], size="300"),
+                    capabilities={"canDownload": True}, md5Checksum="abc"),
+        "v2": _file("v2", "camera_02.mov", "video/quicktime", ["f2"], size="200",
+                    capabilities={"canDownload": True}),
+        "v3": _file("v3", "episode.mp4", "video/mp4", ["f3"], size="300",
+                    capabilities={"canDownload": True}),
         "v4": _file("v4", "notes.txt", "text/plain", ["f1"], size="10"),
         "link1": _file("link1", "shortcut", "application/vnd.google-apps.shortcut", ["f1"],
                        shortcutDetails={"targetId": "f3"}),
@@ -127,11 +166,29 @@ def test_is_video_file():
 def test_file_entry_parsing():
     f = {"id": "x", "name": "a.mp4", "mimeType": "video/mp4", "size": "10",
          "modifiedTime": "2026-01-01T00:00:00.000Z", "parents": ["p"],
-         "downloadUrl": "https://x", "md5Checksum": "m", "version": "3"}
+         "md5Checksum": "m", "version": "3",
+         "capabilities": {"canDownload": True}}
     e = drive_google._file_entry(f)
     assert e["modified_at"] is not None
     assert e["downloadable"] is True
     assert e["version"] == "3"
+    assert "downloadUrl" not in e
+
+
+def test_file_entry_workspace_file_not_downloadable():
+    # Google Workspace files are not directly downloadable as media.
+    f = {"id": "d", "name": "doc", "mimeType": "application/vnd.google-apps.document",
+         "size": "0", "capabilities": {"canDownload": True}}
+    e = drive_google._file_entry(f)
+    assert e["downloadable"] is False
+
+
+def test_file_entry_downloadable_from_capabilities():
+    # downloadable is determined by capabilities.canDownload, not downloadUrl.
+    f = {"id": "y", "name": "b.mp4", "mimeType": "video/mp4", "size": "5",
+         "capabilities": {"canDownload": False}}
+    e = drive_google._file_entry(f)
+    assert e["downloadable"] is False
 
 
 def test_list_children_pagination(drive_tree):

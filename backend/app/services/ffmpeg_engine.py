@@ -44,10 +44,35 @@ def get_ffmpeg_path() -> str:
 
 
 def get_ffprobe_path() -> str | None:
+    """Return a real ffprobe binary path, or None if not available.
+
+    ``imageio-ffmpeg`` supplies only FFmpeg, not FFprobe — it is never reported
+    as a FFprobe source. On Windows, install FFmpeg (which bundles ffprobe) and
+    set ``ARCUS_FFPROBE_PATH`` if it is not on PATH.
+    """
     if settings.ffprobe_path and Path(settings.ffprobe_path).exists():
         return settings.ffprobe_path
-    p = shutil.which("ffprobe")
-    return p
+    return shutil.which("ffprobe")
+
+
+def ffprobe_available() -> bool:
+    return get_ffprobe_path() is not None
+
+
+def ffprobe_status() -> dict[str, Any]:
+    """Actionable FFprobe status for the health/status endpoint."""
+    path = get_ffprobe_path()
+    if path:
+        return {"available": True, "path": path, "detail": "ffprobe found"}
+    return {
+        "available": False,
+        "path": "",
+        "detail": (
+            "ffprobe not found. The bundled imageio-ffmpeg provides FFmpeg only. "
+            "Install FFmpeg (bundles ffprobe) or set ARCUS_FFPROBE_PATH. "
+            "Media probing will use the FFmpeg stderr fallback until then."
+        ),
+    }
 
 
 def ffmpeg_version() -> str:
@@ -153,6 +178,12 @@ def probe(path: str | Path) -> MediaInfo:
         else:
             logger.warning("ffprobe failed for %s: %s", path, proc.stderr[:200])
     if not info.streams:
+        if not ffprobe_available():
+            logger.warning(
+                "ffprobe not available for %s — using FFmpeg stderr fallback for "
+                "media probing. Install FFmpeg/ffprobe or set ARCUS_FFPROBE_PATH.",
+                path,
+            )
         proc = _run([get_ffmpeg_path(), "-i", path], timeout=120)
         parsed = _parse_ffmpeg_info(proc.stderr)
         info.duration = parsed["duration"]

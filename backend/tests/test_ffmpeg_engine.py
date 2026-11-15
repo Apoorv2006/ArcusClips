@@ -99,3 +99,21 @@ def test_thumbnail(sample_video, tmp_path):
     out = str(tmp_path / "thumb.jpg")
     fe.make_thumbnail(sample_video, 30.0, out)
     assert (tmp_path / "thumb.jpg").exists()
+
+
+def test_ffprobe_status_reports_availability(app_env):
+    """ffprobe_status must report available/not-available with an actionable detail."""
+    st = fe.ffprobe_status()
+    assert "available" in st
+    assert "detail" in st
+    if st["available"]:
+        assert st["path"]
+    else:
+        # when not available, the detail must be actionable (not a silent None)
+        assert "ffprobe" in st["detail"].lower()
+        assert "ARCUS_FFPROBE_PATH" in st["detail"] or "ffprobe" in st["detail"]
+
+
+def test_ffprobe_available_matches_path(app_env):
+    """ffprobe_available agrees with whether get_ffprobe_path returns a path."""
+    assert fe.ffprobe_available() == (fe.get_ffprobe_path() is not None)

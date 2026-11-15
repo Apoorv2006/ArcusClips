@@ -159,14 +159,20 @@ All settings are environment variables prefixed with `ARCUS_` (see
 
 ## Google Drive
 
-1. In Google Cloud Console, create OAuth credentials with a **Desktop app** type.
+1. In Google Cloud Console, create an OAuth **Web application** client (the
+   server-side authorization code flow requires a Web application client, not
+   Desktop app credentials). Add an authorized redirect URI.
 2. Set `ARCUS_GOOGLE_OAUTH_CLIENT_ID`, `ARCUS_GOOGLE_OAUTH_CLIENT_SECRET`, and
    make sure `ARCUS_GOOGLE_OAUTH_REDIRECT_URI`
-   (`http://127.0.0.1:8000/api/auth/google/callback`) is an authorized redirect.
-3. In **Drive Studio**, click *Connect Google Drive* and approve. Access/refresh
-   tokens are encrypted at rest (Fernet) and never exposed to the frontend.
+   (`http://127.0.0.1:8000/api/drive/auth/callback`) is an authorized redirect —
+   it must match the configured value exactly.
+3. In **Drive Studio**, click *Connect Google Drive* and approve. The callback
+   resolves the initiating user from a one-time, short-lived OAuth state record
+   (no bearer token is required on the redirect). Access/refresh tokens are
+   encrypted at rest (Fernet) and never exposed to the frontend.
 4. Browse to folders, select them, and *Scan* — ArcusClips discovers videos
-   recursively (following shortcuts, de-duplicating by file id).
+   recursively across My Drive and Shared Drives (following shortcuts,
+   de-duplicating by file id).
 
 The integration is scoped to `drive.readonly`; originals are never modified.
 

@@ -7,7 +7,6 @@ to disk and never load full files into memory.
 """
 from __future__ import annotations
 
-import io
 import logging
 import os
 import secrets
@@ -29,6 +28,16 @@ GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 VIDEO_MIME_HINTS = (
     "video/mp4", "video/quicktime", "video/x-matroska", "video/webm",
     "video/x-msvideo", "video/mpeg", "video/mp2t", "video/ogg",
+)
+
+# Valid Drive v3 metadata fields (downloadUrl is NOT valid and is omitted).
+_FILE_FIELDS = (
+    "nextPageToken, files(id,name,mimeType,size,modifiedTime,parents,"
+    "md5Checksum,version,shortcutDetails,capabilities(canDownload))"
+)
+_FILE_FIELDS_SINGLE = (
+    "id,name,mimeType,size,modifiedTime,parents,"
+    "md5Checksum,version,shortcutDetails,capabilities(canDownload)"
 )
 
 
@@ -111,8 +120,20 @@ def _authorized_client(access_token: str, refresh_token: str | None = None):
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
+def _looks_like_auth_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("401", "invalid_token", "expired", "invalid_grant", "unauthorized")
+    )
+
+
 def client_from_connection(conn) -> Any:
-    """Build an authorized Drive client from a stored (encrypted) connection row."""
+    """Build an authorized Drive client from a stored (encrypted) connection row.
+
+    Refreshes the access token on expiry. If the refresh token is revoked or
+    invalid, marks the connection as expired so the user must reauthorize.
+    """
     access = decrypt_secret(conn.encrypted_access_token or "")
     refresh = decrypt_secret(conn.encrypted_refresh_token or "") or None
     if not access:
@@ -122,24 +143,42 @@ def client_from_connection(conn) -> Any:
         about = client.about().get(fields="user").execute()
         return client, about.get("user", {})
     except Exception as exc:
-        if refresh and ("401" in str(exc) or "invalid_token" in str(exc) or "expired" in str(exc).lower()):
-            new = refresh_tokens(refresh)
+        if _looks_like_auth_error(exc):
+            if not refresh:
+                conn.status = "expired"
+                raise DriveError(
+                    "Google Drive credentials expired and no refresh token is available; "
+                    "reconnect Google Drive"
+                ) from exc
+            try:
+                new = refresh_tokens(refresh)
+            except DriveError as refresh_exc:
+                # refresh_tokens raises for revoked/invalid refresh tokens
+                conn.status = "expired"
+                raise DriveError(
+                    "Google Drive refresh token is invalid or revoked; reconnect Google Drive"
+                ) from refresh_exc
             access = new.get("access_token", access)
-            refresh = new.get("refresh_token", refresh)
-            conn.encrypted_access_token = encrypt_secret(access)
-            conn.encrypted_refresh_token = encrypt_secret(refresh or "")
-            from ..db import utcnow
-
-            conn.token_expires_at = None
-            client = _authorized_client(access, refresh)
-            about = client.about().get(fields="user").execute()
+            # store_tokens preserves the existing refresh token if none is returned
+            store_tokens(conn, new)
+            client = _authorized_client(access, decrypt_secret(conn.encrypted_refresh_token or "") or None)
+            try:
+                about = client.about().get(fields="user").execute()
+            except Exception as exc2:
+                conn.status = "expired"
+                raise DriveError(f"Drive API error after refresh: {exc2}") from exc2
+            conn.status = "connected"
             return client, about.get("user", {})
         raise DriveError(f"Drive API error: {exc}") from exc
 
 
 def store_tokens(conn, tokens: dict[str, Any]) -> None:
     conn.encrypted_access_token = encrypt_secret(tokens.get("access_token", ""))
-    conn.encrypted_refresh_token = encrypt_secret(tokens.get("refresh_token", ""))
+    # Preserve an existing refresh token when Google does not return a
+    # replacement (refresh tokens are long-lived and not always reissued).
+    new_refresh = tokens.get("refresh_token")
+    if new_refresh:
+        conn.encrypted_refresh_token = encrypt_secret(new_refresh)
     from ..db import utcnow
 
     expires = tokens.get("expires_in")
@@ -176,17 +215,26 @@ def _file_entry(f: dict[str, Any]) -> dict[str, Any]:
     targets = []
     if is_shortcut and f.get("shortcutDetails", {}).get("targetId"):
         targets.append(f["shortcutDetails"]["targetId"])
+    mime = f.get("mimeType", "")
+    # Download availability comes from file capabilities, not a downloadUrl field
+    # (downloadUrl is not a valid files.list/files.get metadata field).
+    capabilities = f.get("capabilities") or {}
+    can_download = bool(capabilities.get("canDownload", False))
+    # Google Workspace files (docs/sheets/etc.) are not directly downloadable as
+    # media; treat them as non-downloadable unless capabilities say otherwise.
+    is_workspace_file = mime.startswith("application/vnd.google-apps.") and mime != (
+        "application/vnd.google-apps.shortcut"
+    )
+    downloadable = can_download and not is_workspace_file
     return {
         "id": f["id"],
         "name": f.get("name", ""),
-        "mime_type": f.get("mimeType", ""),
+        "mime_type": mime,
         "size": int(f.get("size", 0) or 0),
         "modified_at": _fmt_modified(f.get("modifiedTime")),
         "parent_id": (f.get("parents") or [""])[0],
         "is_shortcut": is_shortcut,
-        "downloadable": bool(f.get("downloadUrl")) or not f.get("mimeType", "").startswith(
-            "application/vnd.google-apps"
-        ),
+        "downloadable": downloadable,
         "checksum": f.get("md5Checksum", "") or "",
         "version": str(f.get("version", "") or ""),
         "shortcut_targets": targets,
@@ -202,7 +250,9 @@ def list_roots(client) -> list[dict[str, Any]]:
         {"id": "root", "name": "My Drive", "kind": "folder", "is_root": True}
     ]
     try:
-        drives = client.drives().list(pageSize=100).execute()
+        drives = client.drives().list(
+            pageSize=100, supportsAllDrives=True, includeItemsFromAllDrives=True
+        ).execute()
         for d in drives.get("drives", []):
             roots.append({"id": d["id"], "name": d.get("name", ""), "kind": "drive", "is_root": True})
     except Exception as exc:
@@ -210,20 +260,28 @@ def list_roots(client) -> list[dict[str, Any]]:
     return roots
 
 
-def list_children(client, folder_id: str) -> list[dict[str, Any]]:
-    """List children of a folder (or root) with pagination."""
+def list_children(client, folder_id: str, drive_id: str | None = None) -> list[dict[str, Any]]:
+    """List children of a folder (or root) with pagination.
+
+    Supports both My Drive and Shared Drives via ``supportsAllDrives`` and
+    ``includeItemsFromAllDrives``. When ``drive_id`` is supplied the query is
+    scoped to that shared drive.
+    """
     items: list[dict[str, Any]] = []
     page_token = ""
     while True:
         params: dict[str, Any] = {
             "q": f"'{folder_id}' in parents and trashed = false",
             "pageSize": 1000,
-            "fields": (
-                "nextPageToken, files(id,name,mimeType,size,modifiedTime,parents,"
-                "downloadUrl,md5Checksum,version,shortcutDetails)"
-            ),
+            "fields": _FILE_FIELDS,
             "orderBy": "folder,name",
+            # Required for Shared Drive operations; harmless for My Drive.
+            "supportsAllDrives": True,
+            "includeItemsFromAllDrives": True,
         }
+        if drive_id:
+            params["driveId"] = drive_id
+            params["corpora"] = "drive"
         if page_token:
             params["pageToken"] = page_token
         try:
@@ -238,23 +296,58 @@ def list_children(client, folder_id: str) -> list[dict[str, Any]]:
     return items
 
 
-def get_file_meta(client, file_id: str) -> dict[str, Any]:
-    f = client.files().get(
-        fileId=file_id,
-        fields="id,name,mimeType,size,modifiedTime,parents,downloadUrl,md5Checksum,version,shortcutDetails",
-    ).execute()
+def get_file_meta(client, file_id: str, drive_id: str | None = None) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"fields": _FILE_FIELDS_SINGLE}
+    if drive_id:
+        kwargs["supportsAllDrives"] = True
+        kwargs["driveId"] = drive_id
+    f = client.files().get(fileId=file_id, **kwargs).execute()
     return _file_entry(f)
 
 
 # ---------------------------------------------------------------------------
 # Recursive scan
 # ---------------------------------------------------------------------------
+def _resolve_shortcut_target(
+    client, shortcut: dict[str, Any], drive_id: str | None,
+    errors: dict[str, str], stats: dict[str, int],
+) -> dict[str, Any] | None:
+    """Resolve a shortcut's target metadata.
+
+    Returns a dict describing the target with ``is_folder`` / ``is_video``
+    flags, or ``None`` when the target is unsupported or inaccessible (an
+    error is recorded in ``errors``).
+    """
+    targets = shortcut.get("shortcut_targets", [])
+    if not targets:
+        stats["skipped"] += 1
+        return None
+    target_id = targets[0]
+    try:
+        meta = get_file_meta(client, target_id, drive_id=drive_id)
+    except Exception as exc:
+        errors[target_id] = f"Shortcut target inaccessible: {exc}"
+        stats["errors"] += 1
+        return None
+    mime = meta.get("mime_type", "")
+    is_folder = mime == "application/vnd.google-apps.folder"
+    is_video = is_video_file(mime, meta.get("name", ""))
+    if not is_folder and not is_video:
+        stats["skipped"] += 1
+        return None
+    result = dict(meta)
+    result["is_folder"] = is_folder
+    result["is_video"] = is_video
+    return result
+
+
 def scan_folders(
     client,
     folder_ids: list[str],
     exclude_ids: list[str] | None = None,
     progress_cb: ProgressCb | None = None,
     max_files: int = 10000,
+    drive_id: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Recursively crawl folders. Returns (video_files, stats).
 
@@ -282,7 +375,7 @@ def scan_folders(
         visited.add(folder_id)
         cb(0.0, f"Scanning folder: {rel_path or folder_id}")
         try:
-            children = list_children(client, folder_id)
+            children = list_children(client, folder_id, drive_id=drive_id)
         except DriveError as exc:
             stats["errors"] += 1
             errors[folder_id] = str(exc)
@@ -293,10 +386,25 @@ def scan_folders(
             stats["files"] += 1
             cid = child["id"]
             if child["is_shortcut"]:
-                # resolve shortcuts safely: the visited set prevents cycles
-                for target in child.get("shortcut_targets", []):
-                    if target not in visited and target not in exclude:
-                        queue.append((target, rel_path))
+                # A shortcut may point to a folder, a file, or be unsupported.
+                # Resolve the target metadata and act accordingly.
+                resolved = _resolve_shortcut_target(client, child, drive_id, errors, stats)
+                if resolved is None:
+                    # unsupported / inaccessible shortcut already recorded
+                    continue
+                if resolved["is_video"]:
+                    if cid not in videos:
+                        video = dict(resolved)
+                        video["id"] = cid  # register under the shortcut id for dedup
+                        video["name"] = child["name"] or resolved["name"]
+                        video["relative_path"] = "/".join(
+                            p for p in ([rel_path, child["name"]] if rel_path else [child["name"]]) if p
+                        )
+                        videos[cid] = video
+                elif resolved["is_folder"]:
+                    target_id = resolved["id"]
+                    if target_id not in visited and target_id not in exclude:
+                        queue.append((target_id, rel_path))
                 stats["skipped"] += 1
                 continue
             if is_video_file(child["mime_type"], child["name"]):
@@ -333,11 +441,17 @@ def download_file(
     file_id: str,
     out_path: str | Path,
     file_size: int = 0,
+    checksum: str = "",
     progress_cb: ProgressCb | None = None,
     max_retries: int = 3,
     cancel_event=None,
 ) -> str:
-    """Stream a file from Drive to disk with retry/backoff and size limits."""
+    """Stream a file from Drive to disk using MediaIoBaseDownload.
+
+    Writes to a temporary ``.part`` file, retries transient failures with
+    bounded exponential backoff, validates size (and MD5 when supplied) and
+    only moves the file to its final destination after successful validation.
+    """
     cb = progress_cb or (lambda p, m: None)
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -354,7 +468,7 @@ def download_file(
             tmp_path.unlink(missing_ok=True)
             raise DriveError("Download cancelled")
         try:
-            _stream_download(client, file_id, tmp_path, file_size, cb)
+            _media_download(client, file_id, tmp_path, file_size, checksum, cb, cancel_event)
             tmp_path.replace(out_path)
             cb(1.0, "Download complete")
             return str(out_path)
@@ -367,26 +481,48 @@ def download_file(
             time.sleep(min(30, 2**attempt))
 
 
-def _stream_download(client, file_id: str, out_path: Path, file_size: int, cb) -> None:
+def _media_download(client, file_id: str, out_path: Path, file_size: int,
+                    checksum: str, cb, cancel_event) -> None:
+    """Stream media to ``out_path`` via MediaIoBaseDownload with validation."""
+    from googleapiclient.http import MediaIoBaseDownload
+
     request = client.files().get_media(fileId=file_id)
     fh = open(out_path, "wb")
-    total = 0
     try:
-        chunk = request.next_chunk()
-        while chunk is not None:
-            data = chunk.get_raw_content() if hasattr(chunk, "get_raw_content") else None
-            if data is None:
-                data = chunk.get() if isinstance(chunk, io.IOBase) else b""
-            if data:
-                fh.write(data)
-                total += len(data)
-                if file_size:
-                    cb(min(0.99, total / file_size), f"{total / 1048576:.1f} MB")
-            chunk = request.next_chunk()
+        downloader = MediaIoBaseDownload(fh, request)
+        done = False
+        while not done:
+            if cancel_event is not None and cancel_event.is_set():
+                raise DriveError("Download cancelled")
+            try:
+                status, done = downloader.next_chunk(num_retries=3)
+            except Exception as exc:
+                raise exc
+            if status:
+                frac = status.progress()
+                cb(min(0.99, frac), f"{frac * 100:.0f}%")
     finally:
         fh.close()
-    if file_size and total != file_size:
-        raise DriveError(f"Download incomplete: {total} != {file_size} bytes")
+
+    actual_size = out_path.stat().st_size
+    if file_size and actual_size != file_size:
+        raise DriveError(f"Download size mismatch: got {actual_size}, expected {file_size}")
+    if checksum:
+        actual_md5 = _md5_file(out_path)
+        if actual_md5.lower() != checksum.lower():
+            raise DriveError(
+                f"Checksum mismatch: got {actual_md5}, expected {checksum}"
+            )
+
+
+def _md5_file(path: Path) -> str:
+    import hashlib
+
+    h = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def download_url_available(client, file_id: str) -> bool:

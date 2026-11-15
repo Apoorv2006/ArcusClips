@@ -133,3 +133,68 @@ def test_ytdlp_failure(app_env, monkeypatch):
     monkeypatch.setattr(yt_dlp.YoutubeDL, "extract_info", _boom)
     with pytest.raises(ScanError):
         source_scanner.ytdlp_extract_info("https://www.youtube.com/@x")
+
+
+def test_fetch_page_blocks_redirect_to_private(app_env, monkeypatch):
+    """A redirect hop to a private/loopback address must be rejected (SSRF)."""
+    import httpx
+
+    class _RedirectResponse:
+        status_code = 302
+        headers = {"location": "http://127.0.0.1:8000/admin"}
+        text = ""
+
+    class _OKResponse:
+        status_code = 200
+        headers = {"content-type": "text/html"}
+        text = "<html>ok</html>"
+
+    def _fake_get(url, headers=None, follow_redirects=False, timeout=None):
+        # first call redirects to loopback; must never be followed
+        return _RedirectResponse()
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+    with pytest.raises(ValueError):
+        source_scanner._fetch_page("https://example.com/start")
+
+
+def test_fetch_page_blocks_redirect_to_metadata(app_env, monkeypatch):
+    """Redirect to cloud-metadata endpoint must be rejected."""
+    import httpx
+
+    class _RedirectResponse:
+        status_code = 301
+        headers = {"location": "http://169.254.169.254/latest/meta-data/"}
+        text = ""
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _RedirectResponse())
+    with pytest.raises(ValueError):
+        source_scanner._fetch_page("https://example.com/start")
+
+
+def test_fetch_page_limits_redirects(app_env, monkeypatch):
+    """Too many redirects raises ScanError instead of looping forever."""
+    import httpx
+
+    class _RedirectResponse:
+        status_code = 302
+        headers = {"location": "https://example.com/next"}
+        text = ""
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _RedirectResponse())
+    with pytest.raises(ScanError):
+        source_scanner._fetch_page("https://example.com/start")
+
+
+def test_fetch_page_rejects_non_html_non_video(app_env, monkeypatch):
+    """Non-HTML, non-video content type is rejected."""
+    import httpx
+
+    class _Response:
+        status_code = 200
+        headers = {"content-type": "application/octet-stream"}
+        text = "binary"
+
+    monkeypatch.setattr(httpx, "get", lambda *a, **k: _Response())
+    with pytest.raises(ScanError):
+        source_scanner._fetch_page("https://example.com/data.bin")

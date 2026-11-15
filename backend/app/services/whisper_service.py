@@ -44,7 +44,8 @@ def _get_model():
         raise RuntimeError(
             f"Failed to load Whisper model '{settings.whisper_model}'. "
             "The first run downloads model weights from huggingface.co; ensure network "
-            "access or set ARCUS_WHISPER_MODEL_DIR to a local model directory. Original error: {exc}"
+            "access or set ARCUS_WHISPER_MODEL_DIR to a local model directory. "
+            f"Original error: {exc}"
         ) from exc
     _model_cache[key] = model
     return model

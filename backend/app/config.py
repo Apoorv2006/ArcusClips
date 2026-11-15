@@ -89,9 +89,11 @@ class Settings(BaseSettings):
     # ---- Google Drive OAuth ----
     google_oauth_client_id: str = ""
     google_oauth_client_secret: str = ""
-    google_oauth_redirect_uri: str = "http://127.0.0.1:8000/api/auth/google/callback"
+    google_oauth_redirect_uri: str = "http://127.0.0.1:8000/api/drive/auth/callback"
     google_drive_scope: str = "https://www.googleapis.com/auth/drive.readonly"
     oauth_credential_encryption_key: str = ""  # Fernet key; auto-generated if empty
+    # OAuth state (CSRF) lifetime in seconds. One-time use is always enforced.
+    oauth_state_ttl_seconds: int = 600
 
     # ---- Source scanning ----
     allowed_source_domains: str = ""  # comma separated; empty = no domain restriction
