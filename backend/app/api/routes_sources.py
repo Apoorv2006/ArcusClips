@@ -132,6 +132,8 @@ def _register_drive_videos(session: Session, user_id: int, conn_id: int,
         if not df:
             df = DriveFile(
                 user_id=user_id, connection_id=conn_id, drive_file_id=v["id"],
+                target_id=v.get("target_id") or v["id"],
+                drive_id=v.get("drive_id", ""),
                 name=v["name"], mime_type=v["mime_type"], size=v["size"],
                 modified_at=v["modified_at"], parent_id=v.get("parent_id", ""),
                 relative_path=v.get("relative_path", ""), is_shortcut=v.get("is_shortcut", False),
@@ -231,21 +233,45 @@ def api_drive_auth_callback(code: str | None = None, state: str | None = None,
     state_row = session.query(OAuthState).filter(OAuthState.state == state).first()
     if not state_row:
         raise HTTPException(400, "Invalid or unknown OAuth state")
-    if state_row.used:
-        raise HTTPException(400, "OAuth state already used")
-    # enforce a short expiry window
+    # enforce a short expiry window before consuming
     age = (utcnow() - state_row.created_at).total_seconds()
     if age > settings.oauth_state_ttl_seconds:
-        state_row.used = True
+        # mark expired so it cannot be reused
+        session.query(OAuthState).filter(
+            OAuthState.id == state_row.id, OAuthState.used == False  # noqa: E712
+        ).update({"used": True})
         session.flush()
         raise HTTPException(400, "OAuth state has expired")
+
+    # Atomically consume the state with a conditional UPDATE so two concurrent
+    # callbacks cannot both consume the same state. The rowcount tells us if
+    # this callback won the race. Consumption is committed in its own
+    # transaction BEFORE exchanging the authorization code, so a failed
+    # exchange still burns the state (it cannot be replayed).
+    from ..db import get_session_factory
+
+    consume_session = get_session_factory()()
+    try:
+        consumed = (
+            consume_session.query(OAuthState)
+            .filter(OAuthState.id == state_row.id, OAuthState.used == False)  # noqa: E712
+            .update({"used": True}, synchronize_session=False)
+        )
+        consume_session.commit()
+    finally:
+        consume_session.close()
+    if not consumed:
+        raise HTTPException(400, "OAuth state already used")
 
     user = session.get(User, state_row.user_id)
     if not user:
         raise HTTPException(400, "OAuth state references a missing user")
     if not drive_google.oauth_configured():
         raise HTTPException(400, "Google OAuth is not configured")
-    tokens = drive_google.exchange_code(code)
+    try:
+        tokens = drive_google.exchange_code(code)
+    except Exception as exc:
+        raise HTTPException(502, f"Token exchange failed: {exc}")
     conn = session.query(DriveConnection).filter(DriveConnection.user_id == user.id).first()
     if not conn:
         conn = DriveConnection(user_id=user.id, status="connected")
@@ -258,10 +284,8 @@ def api_drive_auth_callback(code: str | None = None, state: str | None = None,
         conn.last_verified_at = utcnow()
     except Exception as exc:
         conn.status = "expired"
-        state_row.used = True
         session.flush()
         raise HTTPException(502, f"Drive verification failed: {exc}")
-    state_row.used = True
     session.flush()
     return {"ok": True, "account_email": conn.account_email}
 
@@ -318,14 +342,31 @@ def api_drive_scan(body: DriveScanRequest, session: Session = Depends(get_db),
     if not conn:
         raise HTTPException(400, "Google Drive is not connected")
     client, _ = drive_google.client_from_connection(conn)
-    videos, stats = drive_google.scan_folders(client, body.folder_ids, body.exclude_ids)
+    # Propagate the shared-drive ID so folder listing, shortcut resolution and
+    # downloads are scoped to the correct Shared Drive.
+    videos, stats = drive_google.scan_folders(
+        client, body.folder_ids, body.exclude_ids, drive_id=body.drive_id
+    )
 
-    # Create the Source record BEFORE registering videos so that
-    # _register_drive_videos can reference source.id when creating Video rows.
-    source = Source(user_id=user.id, type="drive_folder", name="Drive scan",
-                    url_or_id=",".join(body.folder_ids), folder_id=str(conn.id),
-                    scan_status="ok", last_scanned_at=utcnow(), discovered_count=len(videos))
-    session.add(source)
+    folder_key = ",".join(body.folder_ids)
+    # Reuse the existing Source for the same user + folder set (and drive) so
+    # repeated scans do not create duplicate Source records. Keep associations
+    # and discovered counts consistent.
+    source = session.query(Source).filter(
+        Source.user_id == user.id,
+        Source.type == "drive_folder",
+        Source.url_or_id == folder_key,
+    ).first()
+    if source is None:
+        source = Source(user_id=user.id, type="drive_folder", name="Drive scan",
+                        url_or_id=folder_key, folder_id=str(conn.id))
+        session.add(source)
+        session.flush()
+    # record the drive context for future scans
+    source.config = {**(source.config or {}), "drive_id": body.drive_id or ""}
+    source.scan_status = "ok"
+    source.scan_error = ""
+    source.last_scanned_at = utcnow()
     session.flush()
     registered = _register_drive_videos(session, user.id, conn.id, videos, source)
     source.discovered_count = registered

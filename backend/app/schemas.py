@@ -129,6 +129,7 @@ class DriveFolderNode(BaseModel):
 class DriveScanRequest(BaseModel):
     folder_ids: list[str] = Field(min_length=1)
     exclude_ids: list[str] = Field(default_factory=list)
+    drive_id: str | None = None  # Shared Drive ID, when scanning a shared drive
 
 
 class DriveScanProgress(BaseModel):

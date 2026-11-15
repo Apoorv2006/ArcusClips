@@ -96,6 +96,10 @@ def test_detect_source_kind():
 
 
 def test_ytdlp_extract_info_mocked(app_env, monkeypatch):
+    # The extraction logic test; SSRF validation is patched through so the
+    # fake URLs (which do not resolve) are not filtered out here.
+    monkeypatch.setattr(source_scanner, "validate_public_url", lambda url, allowed=None: url)
+
     class _FakeYDL:
         def __init__(self, opts):
             self.opts = opts
@@ -111,8 +115,8 @@ def test_ytdlp_extract_info_mocked(app_env, monkeypatch):
                 "_type": "playlist",
                 "title": "My Playlist",
                 "entries": [
-                    {"title": "Part 1", "webpage_url": "https://example.invalid/v1"},
-                    {"title": "Part 2", "webpage_url": "https://example.invalid/v2"},
+                    {"title": "Part 1", "webpage_url": "https://www.youtube.com/watch?v=v1"},
+                    {"title": "Part 2", "webpage_url": "https://www.youtube.com/watch?v=v2"},
                 ],
             }
 
@@ -122,6 +126,37 @@ def test_ytdlp_extract_info_mocked(app_env, monkeypatch):
     info = source_scanner.ytdlp_extract_info("https://www.youtube.com/playlist?list=x")
     assert info["is_playlist"]
     assert len(info["videos"]) == 2
+
+
+def test_ytdlp_extract_info_filters_unsafe_urls(app_env, monkeypatch):
+    """yt-dlp resolved URLs pointing at private/loopback hosts are filtered out."""
+    class _FakeYDL:
+        def __init__(self, opts):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def extract_info(self, url, download=False):
+            return {
+                "_type": "playlist",
+                "title": "Mixed",
+                "entries": [
+                    {"title": "Public", "webpage_url": "https://www.youtube.com/watch?v=ok"},
+                    {"title": "Private", "webpage_url": "http://127.0.0.1/secret"},
+                ],
+            }
+
+    import yt_dlp
+
+    monkeypatch.setattr(yt_dlp, "YoutubeDL", _FakeYDL)
+    info = source_scanner.ytdlp_extract_info("https://www.youtube.com/playlist?list=x")
+    # only the public URL survives SSRF validation
+    assert len(info["videos"]) == 1
+    assert info["videos"][0]["url"].startswith("https://www.youtube.com/")
 
 
 def test_ytdlp_failure(app_env, monkeypatch):

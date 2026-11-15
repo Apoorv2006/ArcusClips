@@ -207,8 +207,11 @@ def ensure_video_imported(session: Session, user_id: int, video: Video, job: Job
         safe_rel = safe_relative_path(df.relative_path or df.name)
         out_path = out_dir / safe_rel
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        # Use the real target file ID (shortcuts point at a different file);
+        # pass the shared-drive ID so the media request is scoped correctly.
         drive_google.download_file(
-            client, df.drive_file_id, out_path, file_size=df.size, progress_cb=cb,
+            client, df.target_id or df.drive_file_id, out_path, file_size=df.size,
+            progress_cb=cb, drive_id=df.drive_id or None,
         )
         video.local_path = str(out_path)
         video.status = "imported"
