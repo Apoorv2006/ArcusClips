@@ -101,7 +101,7 @@ def test_ytdlp_extract_info_mocked(app_env, monkeypatch):
     monkeypatch.setattr(source_scanner, "validate_public_url", lambda url, allowed=None: url)
 
     class _FakeYDL:
-        def __init__(self, opts):
+        def __init__(self, opts, byte_budget=None):
             self.opts = opts
 
         def __enter__(self):
@@ -120,9 +120,9 @@ def test_ytdlp_extract_info_mocked(app_env, monkeypatch):
                 ],
             }
 
-    import yt_dlp
+    import app.services.ytdlp_guard as ytdlp_guard
 
-    monkeypatch.setattr(yt_dlp, "YoutubeDL", _FakeYDL)
+    monkeypatch.setattr(ytdlp_guard, "GuardedYoutubeDL", _FakeYDL)
     info = source_scanner.ytdlp_extract_info("https://www.youtube.com/playlist?list=x")
     assert info["is_playlist"]
     assert len(info["videos"]) == 2
@@ -131,7 +131,7 @@ def test_ytdlp_extract_info_mocked(app_env, monkeypatch):
 def test_ytdlp_extract_info_filters_unsafe_urls(app_env, monkeypatch):
     """yt-dlp resolved URLs pointing at private/loopback hosts are filtered out."""
     class _FakeYDL:
-        def __init__(self, opts):
+        def __init__(self, opts, byte_budget=None):
             self.opts = opts
 
         def __enter__(self):
@@ -150,9 +150,9 @@ def test_ytdlp_extract_info_filters_unsafe_urls(app_env, monkeypatch):
                 ],
             }
 
-    import yt_dlp
+    import app.services.ytdlp_guard as ytdlp_guard
 
-    monkeypatch.setattr(yt_dlp, "YoutubeDL", _FakeYDL)
+    monkeypatch.setattr(ytdlp_guard, "GuardedYoutubeDL", _FakeYDL)
     info = source_scanner.ytdlp_extract_info("https://www.youtube.com/playlist?list=x")
     # only the public URL survives SSRF validation
     assert len(info["videos"]) == 1
@@ -162,10 +162,12 @@ def test_ytdlp_extract_info_filters_unsafe_urls(app_env, monkeypatch):
 def test_ytdlp_failure(app_env, monkeypatch):
     import yt_dlp
 
+    import app.services.ytdlp_guard as ytdlp_guard
+
     def _boom(self, url, download=False):
         raise yt_dlp.utils.DownloadError("blocked")
 
-    monkeypatch.setattr(yt_dlp.YoutubeDL, "extract_info", _boom)
+    monkeypatch.setattr(ytdlp_guard.GuardedYoutubeDL, "extract_info", _boom)
     with pytest.raises(ScanError):
         source_scanner.ytdlp_extract_info("https://www.youtube.com/@x")
 

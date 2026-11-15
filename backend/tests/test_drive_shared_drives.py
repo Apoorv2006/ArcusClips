@@ -57,6 +57,19 @@ class _RecordingFiles:
         self.media_params = []
 
     def list(self, **params):
+        # Drive API v3 rules: driveId is only valid with corpora="drive"; all
+        # other list params used must belong to the supported set.
+        if "driveId" in params:
+            assert params.get("corpora") == "drive", (
+                "driveId is only valid together with corpora='drive'"
+            )
+        else:
+            assert "corpora" not in params, "corpora='drive' requires driveId"
+        unsupported = set(params) - {
+            "q", "pageToken", "pageSize", "fields", "orderBy", "spaces",
+            "corpora", "driveId", "supportsAllDrives", "includeItemsFromAllDrives",
+        }
+        assert not unsupported, f"Unsupported files.list params: {unsupported}"
         self.list_params.append(params)
         q = params.get("q", "")
         folder_id = q.split("'")[1]
@@ -64,10 +77,12 @@ class _RecordingFiles:
         return _Req({"files": children, "nextPageToken": None})
 
     def get(self, fileId, fields=None, **kwargs):
+        assert "driveId" not in kwargs, "files.get() does not support driveId"
         self.get_params.append({"fileId": fileId, **kwargs})
         return _Req(self.tree[fileId])
 
     def get_media(self, fileId, **kwargs):
+        assert "driveId" not in kwargs, "files.get_media() does not support driveId"
         self.media_params.append({"fileId": fileId, **kwargs})
         return _FakeMedia(self.tree[fileId])
 
@@ -82,6 +97,12 @@ class _FakeDrive:
     def drives(self):
         class _Drives:
             def list(self, **params):
+                unsupported = set(params) - {
+                    "pageSize", "pageToken", "fields", "q", "orderBy",
+                }
+                assert not unsupported, (
+                    f"drives.list() does not support: {unsupported}"
+                )
                 return _Req({"drives": [{"id": "shared-1", "name": "Shared Drive"}]})
         return _Drives()
 
@@ -134,32 +155,35 @@ def test_list_children_shared_drive_uses_drive_id_and_corpora(shared_drive_clien
 
 
 def test_get_file_meta_always_passes_supports_all_drives(shared_drive_client):
-    """get_file_meta always passes supportsAllDrives, and driveId when given."""
+    """get_file_meta always passes supportsAllDrives and never driveId."""
     drive_google.get_file_meta(shared_drive_client, "v1")
     p = shared_drive_client._files.get_params[-1]
     assert p["supportsAllDrives"] is True
     assert "driveId" not in p
 
-    drive_google.get_file_meta(shared_drive_client, "sv1", drive_id="shared-1")
+    # files.get() must not carry driveId even for Shared Drive files
+    drive_google.get_file_meta(shared_drive_client, "sv1")
     p2 = shared_drive_client._files.get_params[-1]
     assert p2["supportsAllDrives"] is True
-    assert p2["driveId"] == "shared-1"
+    assert "driveId" not in p2
+    assert "corpora" not in p2
 
 
-def test_download_passes_supports_all_drives_and_drive_id(shared_drive_client, tmp_path):
-    """Media download requests carry supportsAllDrives and driveId."""
+def test_download_passes_supports_all_drives_never_drive_id(shared_drive_client, tmp_path):
+    """Media download requests carry supportsAllDrives and never driveId."""
     out = tmp_path / "a.mp4"
     drive_google.download_file(shared_drive_client, "v1", out, file_size=0)
     p = shared_drive_client._files.media_params[-1]
     assert p["supportsAllDrives"] is True
     assert "driveId" not in p  # My Drive download
 
+    # files.get_media() must not carry driveId even for Shared Drive targets
     out2 = tmp_path / "b.mp4"
-    drive_google.download_file(shared_drive_client, "sv1", out2, file_size=0,
-                               drive_id="shared-1")
+    drive_google.download_file(shared_drive_client, "sv1", out2, file_size=0)
     p2 = shared_drive_client._files.media_params[-1]
     assert p2["supportsAllDrives"] is True
-    assert p2["driveId"] == "shared-1"
+    assert "driveId" not in p2
+    assert "corpora" not in p2
 
 
 def test_scan_shared_drive_propagates_drive_id(shared_drive_client):

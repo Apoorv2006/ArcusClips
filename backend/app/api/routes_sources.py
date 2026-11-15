@@ -4,7 +4,7 @@ from __future__ import annotations
 import secrets
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
@@ -71,7 +71,8 @@ def api_delete_source(source_id: int, session: Session = Depends(get_db),
 
 
 @router.post("/sources/{source_id}/scan")
-def api_scan_source(source_id: int, session: Session = Depends(get_db),
+def api_scan_source(source_id: int, drive_id: str | None = Query(default=None),
+                    session: Session = Depends(get_db),
                     user: User = Depends(get_current_user)):
     """Scan a source and register discovered videos."""
     source = session.get(Source, source_id)
@@ -89,7 +90,14 @@ def api_scan_source(source_id: int, session: Session = Depends(get_db),
             if not conn:
                 raise HTTPException(400, "Google Drive is not connected")
             client, _ = drive_google.client_from_connection(conn)
-            videos, _stats = drive_google.scan_folders(client, [source.url_or_id])
+            effective_drive_id = drive_id
+            if effective_drive_id is None:
+                effective_drive_id = ((source.config or {}).get("drive_id") or "").strip() or None
+            videos, _stats = drive_google.scan_folders(
+                client, [source.url_or_id], drive_id=effective_drive_id
+            )
+            if drive_id is not None:
+                source.config = {**(source.config or {}), "drive_id": drive_id}
             discovered = _register_drive_videos(session, user.id, conn.id, videos, source)
         elif source.type in ("video_url", "channel", "playlist", "webpage"):
             url = source.url_or_id
@@ -123,35 +131,82 @@ def api_scan_source(source_id: int, session: Session = Depends(get_db),
 
 def _register_drive_videos(session: Session, user_id: int, conn_id: int,
                            videos: list[dict], source: Source) -> int:
+    """Create-or-update inventory entries for discovered Drive videos.
+
+    Identity semantics:
+      * normal file: ``drive_file_id == target_id ==`` the file's own ID;
+      * shortcut: ``drive_file_id`` keeps the shortcut ID (identity/display/
+        dedup) and ``target_id`` holds the resolved target file ID used for
+        media downloads (never the shortcut ID).
+
+    Rescanning refreshes all provider-supplied metadata (target_id, drive_id,
+    name, mime_type, size, modified_at, parent_id, relative_path, is_shortcut,
+    downloadable, checksum, version), so records created before the target_id /
+    drive_id migration are repaired in place. Existing ``Video`` rows keep
+    their identity and associations — nothing is duplicated or rebound.
+    """
     count = 0
     source_id = source.id if source is not None else None
     for v in videos:
+        drive_file_id = v["id"]
+        is_shortcut = bool(v.get("is_shortcut", False))
+        incoming_target = (v.get("target_id") or "").strip()
+        if not is_shortcut:
+            # Normal files always use their own ID as the media target.
+            target_id = drive_file_id
+        else:
+            target_id = incoming_target  # may be "" (unresolved) — repaired on rescan
+
+        provider = {
+            "target_id": target_id,
+            "drive_id": v.get("drive_id") or "",
+            "name": v["name"],
+            "mime_type": v["mime_type"],
+            "size": v["size"],
+            "modified_at": v["modified_at"],
+            "parent_id": v.get("parent_id", ""),
+            "relative_path": v.get("relative_path", ""),
+            "is_shortcut": is_shortcut,
+            "downloadable": v.get("downloadable", True),
+            "checksum": v.get("checksum", ""),
+            "version": v.get("version", ""),
+        }
+
         df = session.query(DriveFile).filter(
-            DriveFile.user_id == user_id, DriveFile.drive_file_id == v["id"]
+            DriveFile.user_id == user_id, DriveFile.drive_file_id == drive_file_id
         ).first()
-        if not df:
+        if df is None:
             df = DriveFile(
-                user_id=user_id, connection_id=conn_id, drive_file_id=v["id"],
-                target_id=v.get("target_id") or v["id"],
-                drive_id=v.get("drive_id", ""),
-                name=v["name"], mime_type=v["mime_type"], size=v["size"],
-                modified_at=v["modified_at"], parent_id=v.get("parent_id", ""),
-                relative_path=v.get("relative_path", ""), is_shortcut=v.get("is_shortcut", False),
-                downloadable=v.get("downloadable", True), checksum=v.get("checksum", ""),
-                version=v.get("version", ""), import_status="discovered",
+                user_id=user_id, connection_id=conn_id, drive_file_id=drive_file_id,
+                import_status="discovered", **provider,
             )
             session.add(df)
             session.flush()
-        # only create the Video row once; update import status freshness
+        else:
+            if provider["is_shortcut"] and not provider["target_id"] and df.target_id:
+                # Never wipe a known target with an unresolved one.
+                provider.pop("target_id")
+            for key, value in provider.items():
+                setattr(df, key, value)
+            session.flush()
+
+        # only create the Video row once; keep associations and metadata stable
         vid = session.query(Video).filter(
             Video.user_id == user_id, Video.drive_file_id == df.id
         ).first()
-        if not vid:
+        if vid is None:
             session.add(Video(
                 user_id=user_id, source_id=source_id, drive_file_id=df.id, kind="drive",
                 name=v["name"], folder_path=v.get("relative_path", ""),
                 status="discovered",
             ))
+        else:
+            # Refresh display metadata without touching processing state, and
+            # backfill a missing source link instead of rebinding it.
+            vid.name = v["name"]
+            vid.folder_path = v.get("relative_path", "")
+            if vid.source_id is None and source_id is not None:
+                vid.source_id = source_id
         count += 1
     session.flush()
     return count
@@ -307,11 +362,16 @@ def api_drive_roots(session: Session = Depends(get_db), user: User = Depends(get
     if not conn:
         raise HTTPException(400, "Google Drive is not connected")
     client, _ = drive_google.client_from_connection(conn)
-    return drive_google.list_roots(client)
+    try:
+        return drive_google.list_roots(client)
+    except drive_google.DriveError as exc:
+        # Never present a partial Shared Drive listing as if it were complete.
+        raise HTTPException(502, str(exc))
 
 
 @router.get("/drive/folders/{folder_id}")
-def api_drive_folder(folder_id: str, session: Session = Depends(get_db),
+def api_drive_folder(folder_id: str, drive_id: str | None = Query(default=None),
+                     session: Session = Depends(get_db),
                      user: User = Depends(get_current_user)):
     conn = session.query(DriveConnection).filter(
         DriveConnection.user_id == user.id, DriveConnection.status == "connected"
@@ -319,7 +379,7 @@ def api_drive_folder(folder_id: str, session: Session = Depends(get_db),
     if not conn:
         raise HTTPException(400, "Google Drive is not connected")
     client, _ = drive_google.client_from_connection(conn)
-    children = drive_google.list_children(client, folder_id)
+    children = drive_google.list_children(client, folder_id, drive_id=drive_id)
     folders = [
         {"id": c["id"], "name": c["name"], "kind": "folder", "is_root": False}
         for c in children if c["mime_type"] == "application/vnd.google-apps.folder"
@@ -349,14 +409,19 @@ def api_drive_scan(body: DriveScanRequest, session: Session = Depends(get_db),
     )
 
     folder_key = ",".join(body.folder_ids)
-    # Reuse the existing Source for the same user + folder set (and drive) so
-    # repeated scans do not create duplicate Source records. Keep associations
-    # and discovered counts consistent.
-    source = session.query(Source).filter(
+    # Reuse the existing Source for the same user + folder set (and the same
+    # drive context) so repeated scans do not create duplicate Source records.
+    # JSON config cannot be filtered portably in SQL — match in Python.
+    candidates = session.query(Source).filter(
         Source.user_id == user.id,
         Source.type == "drive_folder",
         Source.url_or_id == folder_key,
-    ).first()
+    ).all()
+    wanted_drive = body.drive_id or ""
+    source = next(
+        (c for c in candidates if ((c.config or {}).get("drive_id") or "") == wanted_drive),
+        None,
+    )
     if source is None:
         source = Source(user_id=user.id, type="drive_folder", name="Drive scan",
                         url_or_id=folder_key, folder_id=str(conn.id))

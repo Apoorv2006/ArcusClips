@@ -83,7 +83,10 @@ export const api = {
   createSource: (body: { type: string; name?: string; url_or_id: string; folder_id?: string; config?: Record<string, unknown> }) =>
     request<Source>("POST", "/sources", body),
   deleteSource: (id: number) => request<{ ok: boolean }>("DELETE", `/sources/${id}`),
-  scanSource: (id: number) => request<{ ok: boolean; discovered: number }>("POST", `/sources/${id}/scan`),
+  scanSource: (id: number, driveId?: string) =>
+    request<{ ok: boolean; discovered: number }>(
+      "POST", `/sources/${id}/scan${driveId ? `?drive_id=${encodeURIComponent(driveId)}` : ""}`
+    ),
   toggleMonitor: (id: number, monitoring: boolean) =>
     request<{ ok: boolean; monitoring: boolean }>("POST", `/sources/${id}/monitor?monitoring=${monitoring}`),
 
@@ -92,13 +95,14 @@ export const api = {
   driveAuthStart: () => request<{ auth_url: string }>("GET", "/drive/auth/start"),
   driveDisconnect: () => request<{ ok: boolean }>("POST", "/drive/disconnect"),
   driveRoots: () => request<DriveFolderNode[]>("GET", "/drive/roots"),
-  driveFolder: (folderId: string) =>
+  driveFolder: (folderId: string, driveId?: string) =>
     request<{ folders: DriveFolderNode[]; video_files: DriveFileItem[] }>(
-      "GET", `/drive/folders/${folderId}`
+      "GET", `/drive/folders/${folderId}${driveId ? `?drive_id=${encodeURIComponent(driveId)}` : ""}`
     ),
-  driveScan: (folderIds: string[], excludeIds: string[] = []) =>
+  driveScan: (folderIds: string[], excludeIds: string[] = [], driveId?: string) =>
     request<{ ok: boolean; videos: number; stats: Record<string, number> }>(
-      "POST", "/drive/scan", { folder_ids: folderIds, exclude_ids: excludeIds }
+      "POST", "/drive/scan",
+      { folder_ids: folderIds, exclude_ids: excludeIds, ...(driveId ? { drive_id: driveId } : {}) }
     ),
 
   // videos

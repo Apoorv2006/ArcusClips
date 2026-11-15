@@ -7,6 +7,8 @@ interface Selection {
   id: string;
   name: string;
   path: string;
+  /** Shared Drive ID this folder tree belongs to, if any. */
+  driveId?: string;
 }
 
 export default function DriveStudioPage() {
@@ -28,23 +30,43 @@ export default function DriveStudioPage() {
   const [authError, setAuthError] = useState<string | null>(null);
 
   const connect = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (popup: Window) => {
       // Clear any previous auth error when starting a new authorization.
       setAuthError(null);
-      // Open a blank popup SYNCHRONOUSLY from the user's click handler, before
-      // any await, so the browser does not treat it as a popup-blocker case.
-      const popup = window.open("", "_blank", "noopener,noreferrer");
-      if (!popup) {
-        setAuthError(
-          "Popup was blocked. Please allow popups for this site and try again."
-        );
-        throw new Error("Popup blocked");
-      }
-      authPopup.current = popup;
       // Fetch the authorization URL afterward, then navigate the already-open
       // popup to Google's authorization page.
-      const { auth_url } = await api.driveAuthStart();
-      popup.location.replace(auth_url);
+      let auth_url: string;
+      try {
+        const result = await api.driveAuthStart();
+        auth_url = result.auth_url;
+      } catch (err) {
+        // The blank popup is useless now — close it.
+        if (!popup.closed) popup.close();
+        authPopup.current = null;
+        throw new Error(
+          `Could not start Google Drive authorization: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      if (popup.closed) {
+        // The user closed the popup while we were fetching the auth URL.
+        authPopup.current = null;
+        throw new Error("The authorization window was closed before authorization could start.");
+      }
+      try {
+        popup.opener = null;
+        popup.location.replace(auth_url);
+      } catch (err) {
+        // Navigation failed — close the stranded blank popup.
+        if (!popup.closed) popup.close();
+        authPopup.current = null;
+        throw new Error(
+          `Could not navigate to Google's sign-in page: ${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      return popup;
+    },
+    onError: (err) => {
+      setAuthError(err instanceof Error ? err.message : String(err));
     },
     onSuccess: () => {
       // Poll the latest refetch result rather than a stale snapshot.
@@ -96,6 +118,27 @@ export default function DriveStudioPage() {
     };
   }, []);
 
+  // Opens a blank popup SYNCHRONOUSLY from the Connect click handler,
+  // BEFORE any await, so the browser does not treat it as a popup-blocked
+  // case. Must be called directly in the click handler (not inside an async
+  // function body) to count as "user-initiated".
+  const handleConnect = () => {
+    // If an authorization popup is already open, focus it instead of
+    // orphaning it with a second blank popup.
+    if (authPopup.current && !authPopup.current.closed) {
+      authPopup.current.focus();
+      return;
+    }
+    authPopup.current = null;
+    const popup = window.open("", "_blank");
+    if (!popup) {
+      setAuthError("Popup was blocked. Please allow popups for this site and try again.");
+      return;
+    }
+    authPopup.current = popup;
+    connect.mutate(popup);
+  };
+
   const disconnect = useMutation({
     mutationFn: api.driveDisconnect,
     onSuccess: () => {
@@ -111,11 +154,11 @@ export default function DriveStudioPage() {
     },
   });
 
-  const expand = async (folderId: string, name: string, path: string) => {
+  const expand = async (folderId: string, name: string, path: string, driveId?: string) => {
     const next = { ...openFolders, [folderId]: !openFolders[folderId] };
     setOpenFolders(next);
     if (next[folderId] && !childrenCache[folderId]) {
-      const data = await api.driveFolder(folderId);
+      const data = await api.driveFolder(folderId, driveId);
       setChildrenCache((c) => ({
         ...c,
         [folderId]: {
@@ -130,9 +173,30 @@ export default function DriveStudioPage() {
 
   const scan = useMutation({
     mutationFn: async () => {
-      const res = await api.driveScan(selected.map((s) => s.id));
-      setScanResult({ videos: res.videos, stats: res.stats });
-      return res;
+      // The backend scan is scoped to a single Shared Drive per request;
+      // group selections by their drive context and scan each group,
+      // aggregating the result.
+      const groups = new Map<string, Selection[]>();
+      for (const sel of selected) {
+        const key = sel.driveId ?? "";
+        groups.set(key, [...(groups.get(key) ?? []), sel]);
+      }
+      let videos = 0;
+      const stats: Record<string, number> = {};
+      for (const [driveId, group] of groups) {
+        const res = await api.driveScan(
+          group.map((s) => s.id),
+          [],
+          driveId || undefined,
+        );
+        videos += res.videos;
+        for (const [k, v] of Object.entries(res.stats ?? {})) {
+          if (typeof v === "number") stats[k] = (stats[k] ?? 0) + v;
+        }
+      }
+      const agg = { videos, stats };
+      setScanResult(agg);
+      return agg;
     },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["videos"] }),
   });
@@ -157,7 +221,7 @@ export default function DriveStudioPage() {
         <Card className="flex flex-col items-center gap-4 p-10 text-center">
           <StatusBadge status="disconnected" />
           <p className="text-sm text-ink-300">Google Drive is not connected.</p>
-          <button className="btn-primary" onClick={() => connect.mutate()} disabled={connect.isPending}>
+          <button className="btn-primary" onClick={handleConnect} disabled={connect.isPending}>
             {connect.isPending ? "Opening authorization…" : "Connect Google Drive"}
           </button>
           {(connect.isError || authError) && (
@@ -173,10 +237,10 @@ export default function DriveStudioPage() {
     );
   }
 
-  const renderNode = (id: string, name: string, path: string, isRoot = false) => {
+  const renderNode = (id: string, name: string, path: string, isRoot = false, driveId?: string) => {
     const children = childrenCache[id];
     const open = openFolders[id];
-    const sel: Selection = { id, name, path };
+    const sel: Selection = { id, name, path, driveId };
     return (
       <div key={id}>
         <div className="flex items-center gap-2 rounded-lg px-2 py-1.5 hover:bg-ink-850">
@@ -188,7 +252,7 @@ export default function DriveStudioPage() {
           />
           <button
             className="flex flex-1 items-center gap-2 text-left text-sm text-ink-200"
-            onClick={() => expand(id, name, path)}
+            onClick={() => expand(id, name, path, driveId)}
             disabled={isRoot && roots.isLoading}
           >
             <span className="text-ink-500">{isRoot ? "📁" : open ? "▾" : "▸"}</span>
@@ -198,7 +262,7 @@ export default function DriveStudioPage() {
         {open && children && (
           <div className="ml-6 space-y-1 border-l border-ink-700 pl-2">
             {children.folders.map((f) =>
-              renderNode(f.id, f.name, `${path}/${f.name}`)
+              renderNode(f.id, f.name, `${path}/${f.name}`, false, driveId)
             )}
             {children.files.map((f) => (
               <div key={f.id} className="flex items-center gap-2 px-2 py-1.5 text-sm text-ink-400">
@@ -237,7 +301,7 @@ export default function DriveStudioPage() {
             <div className="text-xs text-ink-500">{selected.length} folders selected</div>
           </div>
           <div className="space-y-1">
-            {roots.data.map((r) => renderNode(r.id, r.name, "", true))}
+            {roots.data.map((r) => renderNode(r.id, r.name, "", true, r.kind === "drive" ? r.id : undefined))}
           </div>
         </Card>
       ) : (

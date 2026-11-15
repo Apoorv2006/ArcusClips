@@ -39,6 +39,10 @@ class ScanError(RuntimeError):
     pass
 
 
+class DownloadCancelled(ScanError):
+    """The worker's cancellation signal interrupted an active import."""
+
+
 def allowed_domains() -> list[str]:
     raw = settings.allowed_source_domains or ""
     return [d.strip().lower() for d in raw.split(",") if d.strip()]
@@ -208,6 +212,8 @@ def ytdlp_extract_info(url: str, progress_cb: ProgressCb = None) -> dict[str, An
     url = validate_public_url(url, allowed_domains() or None)
     import yt_dlp
 
+    from .ytdlp_guard import ByteBudget, GuardedYoutubeDL
+
     opts = {
         "quiet": True,
         "no_warnings": True,
@@ -216,6 +222,8 @@ def ytdlp_extract_info(url: str, progress_cb: ProgressCb = None) -> dict[str, An
         "noplaylist": False,
         "ignoreerrors": True,
         "socket_timeout": 30,
+        "hls_prefer_native": True,
+        "external_downloader": "native",
     }
 
     def _hook(d: dict[str, Any]) -> None:
@@ -223,8 +231,9 @@ def ytdlp_extract_info(url: str, progress_cb: ProgressCb = None) -> dict[str, An
             progress_cb(0.5, f"Resolving {d.get('info_dict', {}).get('title', url)}")
 
     opts["progress_hooks"] = [_hook]
+    budget = ByteBudget(settings.max_download_size or None)
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with GuardedYoutubeDL(opts, byte_budget=budget) as ydl:
             info = ydl.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as exc:
         raise ScanError(f"yt-dlp could not resolve this source: {exc}") from exc
@@ -273,26 +282,191 @@ def detect_source_kind(url: str) -> str:
     return "webpage"
 
 
+# Protocols that are known to resolve http(s) URLs and to download through
+# yt-dlp's native (in-process, SSRF-validated) downloaders. Anything else
+# (rtmp, websocket, ffmpeg-handled live HLS, ...) is refused before download.
+_ALLOWED_PROTOCOLS = frozenset({
+    "http", "https",
+    "m3u8", "m3u8_native", "m3u8_frag_urls",
+    "http_dash_segments", "http_dash_segments_generator", "dash_frag_urls",
+    "f4m", "ism",
+})
+
+
+def _snapshot_files(dest_dir) -> set:
+    """All regular files under dest_dir (used to detect artifacts created by an attempt)."""
+    from pathlib import Path
+
+    dest = Path(dest_dir)
+    if not dest.is_dir():
+        return set()
+    return {p for p in dest.rglob("*") if p.is_file()}
+
+
+def _is_temp_artifact(path) -> bool:
+    name = path.name
+    return (
+        name.endswith(".part")
+        or name.endswith(".ytdl")
+        or "-Frag" in name
+        or name.endswith(".frag")
+    )
+
+
+def _cleanup_new_files(dest_dir, before: set, keep=(), temp_only: bool = False) -> list:
+    """Remove files created after ``before`` was taken (except ``keep``).
+
+    When ``temp_only`` is set, only yt-dlp temporary artifacts (.part, .ytdl,
+    fragment files) are removed. Pre-existing (unrelated) files are never
+    touched. Returns the list of removed paths.
+    """
+    from pathlib import Path
+
+    keep_set = {Path(k).resolve() for k in keep}
+    removed = []
+    for p in _snapshot_files(dest_dir):
+        if p in before:
+            continue
+        try:
+            if p.resolve() in keep_set:
+                continue
+        except OSError:
+            pass
+        if temp_only and not _is_temp_artifact(p):
+            continue
+        try:
+            p.unlink()
+            removed.append(p)
+        except OSError:
+            logger.warning("Could not remove download artifact %s", p)
+    return removed
+
+
+def _iter_format_urls(info: dict[str, Any]):
+    yield info.get("url")
+    yield info.get("manifest_url")
+    formats = list(info.get("formats") or []) + list(info.get("requested_formats") or [])
+    for fmt in formats:
+        if isinstance(fmt, dict):
+            yield fmt.get("url")
+    for group in (info.get("subtitles") or {}).values():
+        for sub in group or []:
+            if isinstance(sub, dict):
+                yield sub.get("url")
+    for thumb in info.get("thumbnails") or []:
+        if isinstance(thumb, dict):
+            yield thumb.get("url")
+
+
+def _vet_extracted_info(info: dict[str, Any]) -> None:
+    """Vet everything yt-dlp resolved *before* any media bytes are downloaded.
+
+    Raises ScanError for live streams and for URLs/protocols that cannot be
+    handled by the SSRF-validated native download path.
+    """
+    if info.get("is_live"):
+        raise ScanError(
+            "Live streams are not supported for import (they are unbounded in size and duration)"
+        )
+    protocols = {info.get("protocol")}
+    for fmt in list(info.get("formats") or []) + list(info.get("requested_formats") or []):
+        if isinstance(fmt, dict):
+            protocols.add(fmt.get("protocol"))
+            if fmt.get("is_live"):
+                raise ScanError(
+                    "Live streams are not supported for import (they are unbounded in size and duration)"
+                )
+    for proto in {p for p in protocols if p}:
+        for sp in str(proto).split("+"):
+            if sp.strip() not in _ALLOWED_PROTOCOLS:
+                raise ScanError(f"Unsupported protocol for import: {sp}")
+    for raw in _iter_format_urls(info):
+        if not raw:
+            continue
+        try:
+            validate_public_url(raw)
+        except ValueError as exc:
+            raise ScanError(f"Refusing to download unsafe media URL: {exc}") from exc
+
+
+def _downloaded_filepaths(info: dict[str, Any], dest: "Path", before: set) -> list:
+    paths = []
+    for rd in info.get("requested_downloads") or []:
+        fp = rd.get("filepath") if isinstance(rd, dict) else None
+        if fp:
+            paths.append(fp)
+    if not paths and info.get("_filename"):
+        paths.append(info["_filename"])
+    if not paths:
+        # Fallback: newest non-temp file created during this attempt
+        created = [p for p in (_snapshot_files(dest) - before) if not _is_temp_artifact(p)]
+        if created:
+            newest = max(created, key=lambda p: p.stat().st_mtime)
+            paths.append(str(newest))
+    return paths
+
+
 def import_video_from_url(url: str, dest_dir: str, progress_cb: ProgressCb = None,
                           cancel_event=None) -> dict[str, Any]:
-    """Download a single supported video URL to dest_dir via yt-dlp."""
+    """Download a single supported video URL to dest_dir via yt-dlp.
+
+    Every outbound request yt-dlp makes (metadata, media, fragments, redirects)
+    is SSRF-validated at connect time; the running byte budget enforces
+    ARCUS_MAX_DOWNLOAD_SIZE even without provider size info; the worker's
+    cancellation signal aborts the active transfer; and partial files/artifacts
+    created by a failed or rejected attempt are removed (unrelated files in
+    dest_dir are never touched).
+    """
     if not ytdlp_available():
         raise ScanError("yt-dlp is not installed")
-    url = validate_public_url(url, allowed_domains() or None)
+    try:
+        url = validate_public_url(url, allowed_domains() or None)
+    except ValueError as exc:
+        raise ScanError(str(exc)) from exc
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelled("Download cancelled")
+
+    from pathlib import Path
+
     import yt_dlp
 
+    from .ytdlp_guard import (
+        ByteBudget,
+        DownloadLimitExceeded,
+        GuardedYoutubeDL,
+        SsrfBlockedError,
+    )
+
+    dest = Path(dest_dir)
+    dest.mkdir(parents=True, exist_ok=True)
+    before = _snapshot_files(dest)
+
+    max_bytes = settings.max_download_size or 0
+    budget = ByteBudget(max_bytes if max_bytes > 0 else None)
+
     opts = {
-        "outtmpl": _dest_template(dest_dir),
+        "outtmpl": _dest_template(str(dest)),
         "quiet": True,
         "no_warnings": True,
         "format": "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "merge_output_format": "mp4",
-        "max_filesize": settings.max_download_size,
+        # No max_filesize: it is a silent early-bail (not an exception), which
+        # would route around the running byte budget. The budget and the final
+        # on-disk check below are the authoritative size enforcement.
         "retries": 3,
         "fragment_retries": 3,
+        # Keep all media/fragment traffic on the in-process, SSRF-validated
+        # native download path (never an external downloader subprocess).
+        "hls_prefer_native": True,
+        "external_downloader": "native",
+        "noplaylist": True,
     }
 
     def _hook(d: dict[str, Any]) -> None:
+        if cancel_event is not None and cancel_event.is_set():
+            # yt_dlp's native cancellation exception: re-raised untouched by
+            # yt-dlp's extraction wrapper, so the download aborts promptly.
+            raise yt_dlp.utils.DownloadCancelled("Download cancelled")
         if progress_cb and d.get("status") == "downloading":
             total = d.get("total_bytes") or d.get("total_bytes_estimate")
             done = d.get("downloaded_bytes") or 0
@@ -301,30 +475,55 @@ def import_video_from_url(url: str, dest_dir: str, progress_cb: ProgressCb = Non
 
     opts["progress_hooks"] = [_hook]
 
-    class _Cancel(yt_dlp.utils.DownloadError):
-        pass
-
-    if cancel_event is not None:
-        class _CancelController:
-            def __init__(self):
-                self._cancelled = False
-
-        controller = _CancelController()
-
-        def _check_cancel(_d):
-            if cancel_event.is_set():
-                raise _Cancel("cancelled")
-
-        opts["progress_hooks"].append(_check_cancel)
+    def _fail_cleanup() -> None:
+        _cleanup_new_files(dest, before, keep=())
 
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+        with GuardedYoutubeDL(opts, byte_budget=budget) as ydl:
+            info = ydl.extract_info(url, download=False)
+            if info is None:
+                raise ScanError("yt-dlp returned no data for this URL")
+            # Vet everything that would be downloaded BEFORE the first media
+            # request is made (formats, manifests, subtitles, thumbnails).
+            _vet_extracted_info(info)
+            info = ydl.process_ie_result(info, download=True)
+    except (yt_dlp.utils.DownloadCancelled,) as exc:
+        _fail_cleanup()
+        raise DownloadCancelled("Download cancelled") from exc
+    except DownloadLimitExceeded as exc:
+        _fail_cleanup()
+        raise ScanError(f"Download exceeded max download size ({exc})") from exc
+    except SsrfBlockedError as exc:
+        _fail_cleanup()
+        raise ScanError(f"Download blocked: {exc}") from exc
+    except ScanError:
+        _fail_cleanup()
+        raise
     except Exception as exc:
+        _fail_cleanup()
         raise ScanError(f"Download failed: {exc}") from exc
-    expected = info.get("requested_downloads", [{}])[0].get("filepath") if info.get("requested_downloads") else None
+
+    if not info:
+        _fail_cleanup()
+        raise ScanError("yt-dlp returned no data for this URL")
+
+    # Final on-disk size enforcement — independent of provider-reported sizes.
+    filepaths = _downloaded_filepaths(info, dest, before)
+    existing = [Path(fp) for fp in filepaths if Path(fp).is_file()]
+    if not existing:
+        _fail_cleanup()
+        raise ScanError("yt-dlp did not produce an output file")
+    total = sum(p.stat().st_size for p in existing)
+    if max_bytes > 0 and total > max_bytes:
+        _fail_cleanup()
+        raise ScanError(f"Downloaded media exceeds max download size ({total} > {max_bytes} bytes)")
+
+    # Success: drop temp artifacts created by this attempt; keep the final
+    # output(s) and anything that existed before we started.
+    _cleanup_new_files(dest, before, keep=existing, temp_only=True)
+
     return {
-        "path": expected or "",
+        "path": str(existing[0]),
         "title": info.get("title", ""),
         "url": info.get("webpage_url", url),
     }

@@ -52,6 +52,56 @@ describe("api request helper", () => {
     }
   });
 
+  it("driveFolder threads drive_id as a query param", async () => {
+    const fetchMock = mockFetch(200, { folders: [], video_files: [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.driveFolder("folder-1", "shared-1");
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/drive/folders/folder-1?drive_id=shared-1");
+
+    await api.driveFolder("folder-1");
+    const [url2] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(url2).toBe("/api/drive/folders/folder-1");
+  });
+
+  it("driveFolder escapes drive_id in the query string", async () => {
+    const fetchMock = mockFetch(200, { folders: [], video_files: [] });
+    vi.stubGlobal("fetch", fetchMock);
+    await api.driveFolder("folder-1", "shared drive&x=1");
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/drive/folders/folder-1?drive_id=shared%20drive%26x%3D1");
+  });
+
+  it("driveScan includes drive_id only when provided", async () => {
+    const fetchMock = mockFetch(200, { ok: true, videos: 0, stats: {} });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.driveScan(["a", "b"], [], "shared-1");
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toEqual({
+      folder_ids: ["a", "b"], exclude_ids: [], drive_id: "shared-1",
+    });
+
+    await api.driveScan(["a"]);
+    const [, init2] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(JSON.parse(String(init2.body))).toEqual({ folder_ids: ["a"], exclude_ids: [] });
+    expect("drive_id" in JSON.parse(String(init2.body))).toBe(false);
+  });
+
+  it("scanSource threads drive_id as a query param", async () => {
+    const fetchMock = mockFetch(200, { ok: true, discovered: 0 });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await api.scanSource(7, "shared-1");
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/api/sources/7/scan?drive_id=shared-1");
+
+    await api.scanSource(7);
+    const [url2] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(url2).toBe("/api/sources/7/scan");
+  });
+
   it("clears token on 401", async () => {
     setToken("expired");
     vi.stubGlobal("fetch", mockFetch(401, { detail: "unauthorized" }));

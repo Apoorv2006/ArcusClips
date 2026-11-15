@@ -176,12 +176,75 @@ def create_batch(session: Session, user_id: int, options: dict[str, Any]) -> Bat
     return batch
 
 
+class _CallableCancelAdapter:
+    """Adapts a zero-argument ``cancel_check() -> bool`` callable to the
+    ``is_set()`` interface expected by the download paths."""
+
+    def __init__(self, check: Callable[[], bool]):
+        self._check = check
+
+    def is_set(self) -> bool:
+        try:
+            return bool(self._check())
+        except Exception:
+            # A broken cancel probe must not crash the import; stage-boundary
+            # cancel checks and the worker stop event still apply.
+            return False
+
+
+class _ThrottledJobCancelCheck:
+    """Cancel probe backed by the worker stop event and the job's row in the DB.
+
+    Fresh DB reads are throttled to at most one per ``interval`` seconds so the
+    check stays cheap inside per-chunk download progress hooks, while still
+    observing ``cancel_batch()`` writing ``status='cancelled'`` from the API.
+    """
+
+    def __init__(self, worker: "Worker | None", job_id: int | None, interval: float = 0.5):
+        self._worker = worker
+        self._job_id = job_id
+        self._interval = interval
+        self._last = 0.0
+        self._cached = False
+
+    def __call__(self) -> bool:
+        worker = self._worker
+        if worker is not None and worker._stop.is_set():
+            return True
+        if self._job_id is None:
+            return False
+        now = time.monotonic()
+        if now - self._last < self._interval:
+            return self._cached
+        self._last = now
+        try:
+            from ..db import get_session_factory
+
+            probe = get_session_factory()()
+            try:
+                status = probe.query(Job.status).filter(Job.id == self._job_id).scalar()
+            finally:
+                probe.close()
+            self._cached = status == "cancelled"
+        except Exception:
+            # Transient DB errors: keep the last known state.
+            pass
+        return self._cached
+
+
 # ---------------------------------------------------------------------------
 # Import (Drive download / URL download)
 # ---------------------------------------------------------------------------
 def ensure_video_imported(session: Session, user_id: int, video: Video, job: Job | None = None,
-                          progress_cb: Callable[[float, str], None] | None = None) -> Video:
-    """Ensure the local file exists for a video, importing/downloading if needed."""
+                          progress_cb: Callable[[float, str], None] | None = None,
+                          cancel_event=None) -> Video:
+    """Ensure the local file exists for a video, importing/downloading if needed.
+
+    ``cancel_event`` is an object with an ``is_set()`` method (e.g. threading.Event)
+    carrying the worker's cancellation signal; it is observed during streaming
+    downloads so an in-flight import stops promptly instead of running to
+    completion.
+    """
     cb = progress_cb or (lambda p, m: None)
     if video.local_path and Path(video.local_path).exists():
         return video
@@ -208,11 +271,18 @@ def ensure_video_imported(session: Session, user_id: int, video: Video, job: Job
         out_path = out_dir / safe_rel
         out_path.parent.mkdir(parents=True, exist_ok=True)
         # Use the real target file ID (shortcuts point at a different file);
-        # pass the shared-drive ID so the media request is scoped correctly.
-        drive_google.download_file(
-            client, df.target_id or df.drive_file_id, out_path, file_size=df.size,
-            progress_cb=cb, drive_id=df.drive_id or None,
-        )
+        # files.get_media() does not accept driveId — the target ID is
+        # unambiguous across drives. The stored md5 checksum is passed so the
+        # download is validated against the provider's metadata.
+        try:
+            drive_google.download_file(
+                client, df.target_id or df.drive_file_id, out_path, file_size=df.size,
+                checksum=df.checksum or "", progress_cb=cb, cancel_event=cancel_event,
+            )
+        except drive_google.DriveCancelled as exc:
+            from . import source_scanner
+
+            raise source_scanner.DownloadCancelled("Download cancelled") from exc
         video.local_path = str(out_path)
         video.status = "imported"
         video.status_detail = "Downloaded from Google Drive"
@@ -225,7 +295,8 @@ def ensure_video_imported(session: Session, user_id: int, video: Video, job: Job
 
         out_dir = settings.video_path / "urls"
         out_dir.mkdir(parents=True, exist_ok=True)
-        res = source_scanner.import_video_from_url(video.origin_url, str(out_dir), progress_cb=cb)
+        res = source_scanner.import_video_from_url(video.origin_url, str(out_dir), progress_cb=cb,
+                                                   cancel_event=cancel_event)
         if not res.get("path") or not Path(res["path"]).exists():
             raise RuntimeError("URL import did not produce a file")
         video.local_path = res["path"]
@@ -264,7 +335,8 @@ def run_video_job(job: Job, session: Session, render_semaphore: threading.Semaph
 
     try:
         _update_job(session, job, status="running", stage="importing", progress=0.05)
-        video = ensure_video_imported(session, user_id, video, job)
+        video = ensure_video_imported(session, user_id, video, job,
+                                      cancel_event=_CallableCancelAdapter(cancel))
         if cancel():
             _update_job(session, job, status="cancelled", stage="cancelled")
             return
@@ -373,6 +445,17 @@ def run_video_job(job: Job, session: Session, render_semaphore: threading.Semaph
         log_event(session, user_id, "info", f"Completed video job for {video.name}")
 
     except Exception as exc:
+        from .source_scanner import DownloadCancelled
+
+        if isinstance(exc, DownloadCancelled):
+            # Cancellation requested while the import was in flight — keep the
+            # existing cancellation semantics (status cancelled, batch recomputed).
+            logger.info("Job %s cancelled during import", job.id)
+            _update_job(session, job, status="cancelled", stage="cancelled", error="Cancelled")
+            log_event(session, user_id, "info", f"Job cancelled for {video.name if video else job.id}")
+            if job.batch:
+                compute_batch_status(session, job.batch)
+            return
         logger.error("Job %s failed: %s\n%s", job.id, exc, traceback.format_exc())
         _update_job(session, job, status="failed", stage="failed", error=str(exc))
         log_event(session, user_id, "error", f"Job failed for {video.name if video else job.id}: {exc}")
@@ -605,7 +688,9 @@ class Worker:
                 job = session.get(Job, job_id)
                 if not job or job.status != "running":
                     return
-                run_video_job(job, session, self._render_sem)
+                cancel_probe = _ThrottledJobCancelCheck(self, job.id)
+                run_video_job(job, session, self._render_sem,
+                              cancel_check=cancel_probe)
                 session.commit()
             finally:
                 session.close()
