@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import secrets
+import socket
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -137,6 +138,64 @@ _BLOCKED_HOSTNAMES = {
 _BLOCKED_SUFFIXES = (".local", ".internal", ".localhost")
 
 
+def is_public_ip(ip_str: str) -> bool:
+    """True when ``ip_str`` is a publicly routable, non-special IP address.
+
+    Loopback, private, link-local, multicast, reserved, unspecified and other
+    non-global destinations (including IPv4-mapped IPv6 forms such as
+    ``::ffff:127.0.0.1``) are rejected.
+    """
+    try:
+        addr = ipaddress.ip_address((ip_str or "").split("%")[0])
+    except ValueError:
+        return False
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        addr = mapped
+    return not (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+        or not addr.is_global
+    )
+
+
+def resolve_public_addrinfo(host: str, port: int | None):
+    """Resolve ``host`` and return raw ``getaddrinfo`` results, validating that
+    EVERY resolved destination is public.
+
+    Raises ``ValueError`` when resolution fails or any resolved address is a
+    prohibited destination (mixed public/private answers are rejected too).
+    The returned list is what a connecting socket should use — resolving once
+    and connecting to the enumerated results avoids a DNS time-of-check /
+    time-of-use gap and DNS rebinding between validation and connect.
+    """
+    try:
+        infos = socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM)
+    except OSError as exc:
+        raise ValueError(f"Could not resolve host: {exc}") from exc
+    if not infos:
+        raise ValueError("Could not resolve host: empty resolution result")
+    for info in infos:
+        ip = info[4][0]
+        if not is_public_ip(ip):
+            raise ValueError(f"Access to non-public address {ip} is not allowed")
+    return infos
+
+
+def check_hostname(host: str) -> str:
+    """Validate a bare hostname (not IP literal resolution). Raises ValueError."""
+    lowered = (host or "").lower().strip(".")
+    if not lowered:
+        raise ValueError("URL has no host")
+    if lowered in _BLOCKED_HOSTNAMES or lowered.endswith(_BLOCKED_SUFFIXES):
+        raise ValueError("Access to this host is not allowed")
+    return lowered
+
+
 def validate_public_url(url: str, allowed_domains: list[str] | None = None) -> str:
     """Validate a URL for fetching. Blocks private/loopback ranges and (optionally)
     enforces a domain allowlist. Returns the normalized URL or raises ValueError."""
@@ -147,32 +206,10 @@ def validate_public_url(url: str, allowed_domains: list[str] | None = None) -> s
     if parsed.scheme not in ("http", "https"):
         raise ValueError("Only http(s) URLs are allowed")
     host = parsed.hostname or ""
-    if not host:
-        raise ValueError("URL has no host")
-    lowered = host.lower().strip(".")
-    if lowered in _BLOCKED_HOSTNAMES or lowered.endswith(_BLOCKED_SUFFIXES):
-        raise ValueError("Access to this host is not allowed")
-    # Resolve and reject private/loopback/link-local IPs.
-    try:
-        import socket
-
-        infos = socket.getaddrinfo(lowered, parsed.port or (443 if parsed.scheme == "https" else 80))
-        ips = {info[4][0] for info in infos}
-        for ip in ips:
-            addr = ipaddress.ip_address(ip)
-            if (
-                addr.is_private
-                or addr.is_loopback
-                or addr.is_link_local
-                or addr.is_reserved
-                or addr.is_multicast
-                or addr.is_unspecified
-            ):
-                raise ValueError(f"Access to private address {ip} is not allowed")
-    except ValueError as exc:
-        raise
-    except OSError as exc:
-        raise ValueError(f"Could not resolve host: {exc}") from exc
+    lowered = check_hostname(host)
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    # Resolve and reject private/loopback/link-local IPs (all of them).
+    resolve_public_addrinfo(lowered, port)
 
     if allowed_domains:
         allowed = {d.lower().lstrip(".") for d in allowed_domains if d.strip()}

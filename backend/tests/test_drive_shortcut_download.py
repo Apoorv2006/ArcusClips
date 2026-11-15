@@ -54,6 +54,7 @@ def shortcut_drive(client, app_env, monkeypatch):
             return _Req(tree[fileId])
 
         def get_media(self, fileId, **kwargs):
+            assert "driveId" not in kwargs, "files.get_media() does not support driveId"
             self.last_media_id = fileId
             self.last_media_kwargs = kwargs
             return _FakeMedia(tree[fileId])
@@ -169,7 +170,6 @@ def test_download_uses_target_id_not_shortcut_id(client, auth_headers, shortcut_
         out = tmp_path / "episode.mp4"
         path = drive_google.download_file(
             fake, df.target_id, out, file_size=0,
-            drive_id=df.drive_id or None,
         )
     finally:
         session.close()

@@ -45,6 +45,22 @@ class DriveError(RuntimeError):
     pass
 
 
+class DriveCancelled(DriveError):
+    """Cancellation was requested while a Drive download was in flight.
+
+    A distinct type so the retry loop in ``download_file`` (and callers) do not
+    treat cancellation as a transient failure worth retrying.
+    """
+
+
+class DriveLimitExceeded(DriveError):
+    """The download exceeded the configured maximum size.
+
+    A distinct type so the retry loop in ``download_file`` does not retry a
+    deterministic limit violation.
+    """
+
+
 # ---------------------------------------------------------------------------
 # OAuth
 # ---------------------------------------------------------------------------
@@ -251,18 +267,37 @@ def _file_entry(f: dict[str, Any]) -> dict[str, Any]:
 # Browsing
 # ---------------------------------------------------------------------------
 def list_roots(client) -> list[dict[str, Any]]:
-    """My Drive root + shared drives."""
+    """My Drive root + shared drives.
+
+    Uses only parameters supported by the Drive API v3 ``drives.list``
+    endpoint (``pageSize``, ``pageToken`` and ``fields``) and pages through
+    the full ``nextPageToken`` chain so Shared Drives beyond the first page
+    are not silently omitted. API failures raise ``DriveError`` instead of
+    returning a partial listing that looks complete.
+    """
     roots: list[dict[str, Any]] = [
         {"id": "root", "name": "My Drive", "kind": "folder", "is_root": True}
     ]
-    try:
-        drives = client.drives().list(
-            pageSize=100, supportsAllDrives=True, includeItemsFromAllDrives=True
-        ).execute()
-        for d in drives.get("drives", []):
-            roots.append({"id": d["id"], "name": d.get("name", ""), "kind": "drive", "is_root": True})
-    except Exception as exc:
-        logger.warning("Shared drives listing failed: %s", exc)
+    page_token = ""
+    while True:
+        params: dict[str, Any] = {
+            "pageSize": 100,
+            "fields": "nextPageToken, drives(id,name)",
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        try:
+            resp = client.drives().list(**params).execute()
+        except Exception as exc:
+            raise DriveError(f"Failed to list Shared Drives: {exc}") from exc
+        for d in resp.get("drives", []):
+            drive_id = d.get("id")
+            if not drive_id:
+                continue
+            roots.append({"id": drive_id, "name": d.get("name", ""), "kind": "drive", "is_root": True})
+        page_token = resp.get("nextPageToken", "")
+        if not page_token:
+            break
     return roots
 
 
@@ -302,14 +337,14 @@ def list_children(client, folder_id: str, drive_id: str | None = None) -> list[d
     return items
 
 
-def get_file_meta(client, file_id: str, drive_id: str | None = None) -> dict[str, Any]:
+def get_file_meta(client, file_id: str) -> dict[str, Any]:
+    # files.get() supports supportsAllDrives but NOT driveId; the Shared Drive
+    # context is not needed for single-file metadata retrieval.
     kwargs: dict[str, Any] = {
         "fields": _FILE_FIELDS_SINGLE,
         # Required for Shared Drive files; harmless for My Drive.
         "supportsAllDrives": True,
     }
-    if drive_id:
-        kwargs["driveId"] = drive_id
     f = client.files().get(fileId=file_id, **kwargs).execute()
     return _file_entry(f)
 
@@ -318,7 +353,7 @@ def get_file_meta(client, file_id: str, drive_id: str | None = None) -> dict[str
 # Recursive scan
 # ---------------------------------------------------------------------------
 def _resolve_shortcut_target(
-    client, shortcut: dict[str, Any], drive_id: str | None,
+    client, shortcut: dict[str, Any],
     errors: dict[str, str], stats: dict[str, int],
 ) -> dict[str, Any] | None:
     """Resolve a shortcut's target metadata.
@@ -333,7 +368,7 @@ def _resolve_shortcut_target(
         return None
     target_id = targets[0]
     try:
-        meta = get_file_meta(client, target_id, drive_id=drive_id)
+        meta = get_file_meta(client, target_id)
     except Exception as exc:
         errors[target_id] = f"Shortcut target inaccessible: {exc}"
         stats["errors"] += 1
@@ -397,7 +432,7 @@ def scan_folders(
             if child["is_shortcut"]:
                 # A shortcut may point to a folder, a file, or be unsupported.
                 # Resolve the target metadata and act accordingly.
-                resolved = _resolve_shortcut_target(client, child, drive_id, errors, stats)
+                resolved = _resolve_shortcut_target(client, child, errors, stats)
                 if resolved is None:
                     # unsupported / inaccessible shortcut already recorded
                     continue
@@ -462,7 +497,6 @@ def download_file(
     progress_cb: ProgressCb | None = None,
     max_retries: int = 3,
     cancel_event=None,
-    drive_id: str | None = None,
 ) -> str:
     """Stream a file from Drive to disk using MediaIoBaseDownload.
 
@@ -470,9 +504,10 @@ def download_file(
     bounded exponential backoff, validates size (and MD5 when supplied) and
     only moves the file to its final destination after successful validation.
 
-    ``drive_id`` scopes the request to a Shared Drive (passes ``supportsAllDrives``
-    and ``driveId`` to the media request). The download size limit is enforced
-    while streaming even when the provider does not report the expected size.
+    The media request carries ``supportsAllDrives=True`` (``files.get_media()``
+    does not accept ``driveId``; the file ID is unambiguous across drives).
+    The download size limit is enforced while streaming even when the provider
+    does not report the expected size.
     """
     cb = progress_cb or (lambda p, m: None)
     out_path = Path(out_path)
@@ -488,13 +523,16 @@ def download_file(
     while True:
         if cancel_event is not None and cancel_event.is_set():
             tmp_path.unlink(missing_ok=True)
-            raise DriveError("Download cancelled")
+            raise DriveCancelled("Download cancelled")
         try:
             _media_download(client, file_id, tmp_path, file_size, checksum, cb,
-                            cancel_event, drive_id=drive_id)
+                            cancel_event)
             tmp_path.replace(out_path)
             cb(1.0, "Download complete")
             return str(out_path)
+        except (DriveCancelled, DriveLimitExceeded):
+            tmp_path.unlink(missing_ok=True)
+            raise
         except Exception as exc:
             attempt += 1
             cb(0.0, f"Download attempt {attempt} failed: {exc}")
@@ -505,7 +543,7 @@ def download_file(
 
 
 def _media_download(client, file_id: str, out_path: Path, file_size: int,
-                    checksum: str, cb, cancel_event, drive_id: str | None = None) -> None:
+                    checksum: str, cb, cancel_event) -> None:
     """Stream media to ``out_path`` via MediaIoBaseDownload with validation.
 
     Enforces ``settings.max_download_size`` during streaming (even when
@@ -514,9 +552,8 @@ def _media_download(client, file_id: str, out_path: Path, file_size: int,
     """
     from googleapiclient.http import MediaIoBaseDownload
 
+    # files.get_media() supports supportsAllDrives but NOT driveId.
     kwargs: dict[str, Any] = {"fileId": file_id, "supportsAllDrives": True}
-    if drive_id:
-        kwargs["driveId"] = drive_id
     request = client.files().get_media(**kwargs)
     fh = open(out_path, "wb")
     written = 0
@@ -526,16 +563,13 @@ def _media_download(client, file_id: str, out_path: Path, file_size: int,
         done = False
         while not done:
             if cancel_event is not None and cancel_event.is_set():
-                raise DriveError("Download cancelled")
-            try:
-                status, done = downloader.next_chunk(num_retries=3)
-            except Exception:
-                raise
+                raise DriveCancelled("Download cancelled")
+            status, done = downloader.next_chunk(num_retries=3)
             if status:
                 # MediaIoBaseDownload writes to the file handle; track bytes.
                 written = fh.tell()
                 if max_size and written > max_size:
-                    raise DriveError(
+                    raise DriveLimitExceeded(
                         f"Download exceeded max size ({written} > {max_size})"
                     )
                 frac = status.progress()
@@ -547,7 +581,7 @@ def _media_download(client, file_id: str, out_path: Path, file_size: int,
     if file_size and actual_size != file_size:
         raise DriveError(f"Download size mismatch: got {actual_size}, expected {file_size}")
     if max_size and actual_size > max_size:
-        raise DriveError(f"Download exceeded max size ({actual_size} > {max_size})")
+        raise DriveLimitExceeded(f"Download exceeded max size ({actual_size} > {max_size})")
     if checksum:
         actual_md5 = _md5_file(out_path)
         if actual_md5.lower() != checksum.lower():
