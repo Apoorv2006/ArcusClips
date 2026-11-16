@@ -76,6 +76,14 @@ class Settings(BaseSettings):
     # When LM Studio is unavailable, fall back to deterministic local heuristics.
     allow_heuristic_fallback: bool = True
 
+    # ---- Clip selection ----
+    # Soft extension budget (seconds) beyond the target clip length (the
+    # configured duration-preset maximum) used to reach a natural speech
+    # boundary — sentence-ending punctuation or a pause — instead of cutting
+    # mid-sentence or mid-word. Never used to extend a clip whose speech
+    # already completes inside the target window.
+    clip_duration_tolerance_seconds: float = 4.0
+
     # ---- Processing resources ----
     max_processing_concurrency: int = 2
     max_render_concurrency: int = 2

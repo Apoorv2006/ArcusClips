@@ -406,6 +406,7 @@ def run_video_job(job: Job, session: Session, render_semaphore: threading.Semaph
             min_sec=min_sec,
             max_sec=max_sec,
             quality=quality,
+            media_path=video.local_path,
         )
         candidates = selection_result["candidates"]
         if not candidates:

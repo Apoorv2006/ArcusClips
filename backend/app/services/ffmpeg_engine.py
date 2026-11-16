@@ -430,6 +430,45 @@ def extract_audio(video_path: str, out_wav: str, timeout: float = 1800) -> str:
     return out_wav
 
 
+def detect_silences(path: str | Path, noise_db: float = -35.0,
+                    min_silence_duration: float = 0.45,
+                    timeout: float = 900) -> list[tuple[float, float]]:
+    """Detect silence intervals in a media file via FFmpeg's silencedetect filter.
+
+    Used only when transcript word timestamps are unavailable/unusable. Returns
+    a list of (silence_start, silence_end) in source seconds, ascending. The
+    trailing unterminated silence_start (silence running to EOF) is ignored —
+    callers clamp against the media duration anyway. Never raises: any
+    failure (missing binary, no audio stream, timeout) logs a warning and
+    yields [], in which case callers fall back to duration-based behaviour.
+    """
+    cmd = [
+        get_ffmpeg_path(), "-hide_banner", "-i", str(path),
+        "-vn", "-af", f"silencedetect=noise={noise_db}dB:d={min_silence_duration}",
+        "-f", "null", "-",
+    ]
+    try:
+        proc = _run(cmd, timeout=timeout)
+    except Exception as exc:  # timeout / missing ffmpeg / spawn failure
+        logger.warning("silence detection failed for %s: %s", path, exc)
+        return []
+    silences: list[tuple[float, float]] = []
+    open_start: float | None = None
+    for line in (proc.stderr or "").splitlines():
+        m = re.search(r"silence_start:\s*(-?\d+(?:\.\d+)?)", line)
+        if m:
+            open_start = float(m.group(1))
+            continue
+        m = re.search(r"silence_end:\s*(-?\d+(?:\.\d+)?)", line)
+        if m:
+            end = float(m.group(1))
+            start = open_start if open_start is not None else 0.0
+            if end > start:
+                silences.append((round(start, 3), round(end, 3)))
+            open_start = None
+    return silences
+
+
 def render_clip(
     source_path: str,
     start: float,
