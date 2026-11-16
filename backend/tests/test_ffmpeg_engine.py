@@ -117,3 +117,32 @@ def test_ffprobe_status_reports_availability(app_env):
 def test_ffprobe_available_matches_path(app_env):
     """ffprobe_available agrees with whether get_ffprobe_path returns a path."""
     assert fe.ffprobe_available() == (fe.get_ffprobe_path() is not None)
+
+
+def test_filter_path_escapes_windows_style_paths():
+    # drive-letter colon escaped, backslashes to forward slashes, value quoted
+    assert fe._filter_path(r"C:\Users\irons\fonts dir") == "'C\\:/Users/irons/fonts dir'"
+    # spaces, emoji and dollar signs survive (inside single quotes)
+    assert fe._filter_path("/tmp/fonts:dir 💰 $1") == "'/tmp/fonts\\:dir 💰 $1'"
+
+
+def test_render_with_captions_and_fontsdir_in_colon_dir(sample_video, tmp_path, monkeypatch):
+    """Regression: render must succeed when the output dir or the fontsdir
+    contains ':' (e.g. 'C:\\...' on Windows) and emoji — the ass filter used to
+    receive the raw path, so ':' split the option and libass rejected it with
+    "Error applying option 'original_size' ... Invalid argument"."""
+    out_dir = tmp_path / "user: clips 💰 $dir"
+    out_dir.mkdir()
+    fonts_dir = tmp_path / "fonts: dir 💰"
+    fonts_dir.mkdir()
+    monkeypatch.setattr(fe, "_fontsdir", lambda: str(fonts_dir))
+
+    out = str(out_dir / "clip1_v1_some video 💰 $200+.mp4")
+    words = [("hello", 0.0, 0.8), ("world", 0.8, 1.6), ("again", 1.6, 2.4)]
+    result = fe.render_clip(sample_video, 1.0, 4.0, out, style="bounce",
+                            layout="blur", words=words)
+    assert result["ok"], result.get("error")
+    rendered = fe.probe(out)
+    assert rendered.valid
+    # caption sidecar was cleaned up
+    assert [p for p in out_dir.iterdir() if p.name.startswith(".captions_")] == []

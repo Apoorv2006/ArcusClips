@@ -82,6 +82,28 @@ def resolve_model(requested: str | None = None) -> str:
     return models[0]
 
 
+def _json_response_format(mode: str) -> dict | None:
+    """response_format payload for a given mode, or None for plain text."""
+    if mode == "json_object":
+        return {"type": "json_object"}
+    if mode == "json_schema":
+        return {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "arcus_structured_response",
+                "schema": {"type": "object"},
+            },
+        }
+    return None  # text mode: no response_format; extract_json parses the reply
+
+
+# Which response_format this server accepts. Some LM Studio builds only accept
+# 'json_schema' or 'text' (HTTP 400: "'response_format.type' must be
+# 'json_schema' or 'text'"); others accept the OpenAI-style 'json_object'.
+# We start optimistic and adapt once, then remember the working mode.
+_json_rf_mode = "json_object"
+
+
 def chat(
     messages: list[dict[str, str]],
     model: str | None = None,
@@ -90,6 +112,7 @@ def chat(
     json_mode: bool = False,
 ) -> str:
     """Send a chat completion request. Returns assistant message content."""
+    global _json_rf_mode
     url = f"{_base_url()}/chat/completions"
     payload: dict[str, Any] = {
         "model": model or resolve_model(),
@@ -98,12 +121,39 @@ def chat(
         "max_tokens": max_tokens or settings.lmstudio_max_tokens,
     }
     if json_mode:
-        payload["response_format"] = {"type": "json_object"}
-    try:
-        resp = httpx.post(url, json=payload, headers=_headers(), timeout=_timeout())
-    except httpx.HTTPError as exc:
-        raise LMStudioError(f"Could not reach LM Studio at {_base_url()}: {exc}") from exc
-    if resp.status_code != 200:
+        order = ("json_object", "json_schema", "text")
+        stages = list(order[order.index(_json_rf_mode):])
+    else:
+        stages = [None]
+
+    resp = None
+    for mode in stages:
+        if mode:
+            rf = _json_response_format(mode)
+            if rf is not None:
+                payload["response_format"] = rf
+            else:
+                payload.pop("response_format", None)
+        try:
+            resp = httpx.post(url, json=payload, headers=_headers(), timeout=_timeout())
+        except httpx.HTTPError as exc:
+            raise LMStudioError(f"Could not reach LM Studio at {_base_url()}: {exc}") from exc
+        if (
+            resp.status_code == 400
+            and json_mode
+            and mode != "text"
+            and "response_format" in resp.text
+        ):
+            next_mode = "json_schema" if mode == "json_object" else "text"
+            logger.warning(
+                "LM Studio rejected response_format %r (%s); adapting to %r",
+                mode, resp.text[:200], next_mode,
+            )
+            _json_rf_mode = next_mode
+            continue
+        break
+    if resp is None or resp.status_code != 200:
+        assert resp is not None
         raise LMStudioError(f"LM Studio chat request failed (HTTP {resp.status_code}): {resp.text[:200]}")
     try:
         data = resp.json()
