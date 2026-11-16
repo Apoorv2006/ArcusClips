@@ -8,6 +8,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import subprocess
 from pathlib import Path
 from typing import Any, Callable
 
@@ -60,6 +61,36 @@ def file_hash(path: str | Path) -> str:
     return h.hexdigest()
 
 
+def _decode_audio_f32(audio_path: str, sampling_rate: int = 16000):
+    """Decode an audio file to float32 mono samples using FFmpeg.
+
+    faster-whisper passes ``metadata_errors`` to ``av.open()``, a parameter
+    that only exists in PyAV >= 11. If the environment has an older PyAV,
+    faster-whisper's own ``decode_audio`` raises ``TypeError`` before touching
+    the model. The media is already on disk, so decoding with FFmpeg (bundled
+    via imageio-ffmpeg) produces the exact same f32le PCM that decode_audio
+    yields — float32 in [-1, 1], 16 kHz mono — and the model accepts a samples
+    array in place of a path.
+    """
+    import numpy as np
+
+    from . import ffmpeg_engine
+
+    cmd = [
+        ffmpeg_engine.get_ffmpeg_path(),
+        "-nostdin", "-loglevel", "error",
+        "-i", str(audio_path),
+        "-ac", "1", "-ar", str(sampling_rate),
+        "-f", "f32le", "-acodec", "pcm_f32le",
+        "-",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, check=False)
+    if proc.returncode != 0 or not proc.stdout:
+        detail = (proc.stderr or b"").decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg failed to decode audio for transcription: {detail}")
+    return np.frombuffer(proc.stdout, dtype=np.float32)
+
+
 def transcribe_audio(
     audio_path: str,
     progress_cb: ProgressCb | None = None,
@@ -72,13 +103,25 @@ def transcribe_audio(
     cb = progress_cb or _no_progress
     model = _get_model()
     cb(0.05, f"Loading Whisper model '{settings.whisper_model}'")
-    segments_iter, info = model.transcribe(
-        audio_path,
-        language=language or (settings.whisper_language or None),
-        word_timestamps=True,
-        beam_size=5,
-        vad_filter=True,
-    )
+    transcribe_kwargs: dict[str, Any] = {
+        "language": language or (settings.whisper_language or None),
+        "word_timestamps": True,
+        "beam_size": 5,
+        "vad_filter": True,
+    }
+    try:
+        segments_iter, info = model.transcribe(audio_path, **transcribe_kwargs)
+    except TypeError as exc:
+        if "metadata_errors" not in str(exc):
+            raise
+        # Environment has PyAV < 11 (or no PyAV): faster-whisper's decode_audio
+        # is unusable. Decode with FFmpeg and feed the samples directly.
+        logger.warning(
+            "faster-whisper's audio decode failed (%s). Falling back to FFmpeg decode. "
+            "Upgrade with: pip install -U av", exc,
+        )
+        samples = _decode_audio_f32(audio_path)
+        segments_iter, info = model.transcribe(samples, **transcribe_kwargs)
     cb(0.15, f"Detected language: {info.language} (probability {info.language_probability:.2f})")
     segments: list[dict[str, Any]] = []
     total = info.duration or 1.0

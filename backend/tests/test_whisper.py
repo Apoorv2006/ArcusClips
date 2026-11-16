@@ -68,3 +68,78 @@ def test_file_hash_is_deterministic(tmp_path):
     h2 = whisper_service.file_hash(p)
     assert h1 == h2
     assert len(h1) == 32
+
+
+def test_transcribe_audio_falls_back_to_ffmpeg_when_av_too_old(tmp_path, monkeypatch):
+    """Simulate PyAV < 11 (the 'metadata_errors' TypeError from faster-whisper's
+    decode_audio): transcription must still succeed using FFmpeg-decoded samples
+    instead of crashing the job."""
+    import subprocess
+    import types
+
+    import numpy as np
+
+    from app.services import ffmpeg_engine
+
+    wav = tmp_path / "tone.wav"
+    subprocess.run(
+        [ffmpeg_engine.get_ffmpeg_path(), "-y", "-loglevel", "error",
+         "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+         "-ac", "1", "-ar", "16000", str(wav)],
+        capture_output=True, check=True,
+    )
+
+    seen: list[str] = []
+
+    class _Info:
+        language = "en"
+        language_probability = 0.99
+        duration = 1.0
+
+    class _Word:
+        def __init__(self, word, start, end):
+            self.word = word
+            self.start = start
+            self.end = end
+
+    class _Seg:
+        start, end, text = 0.0, 1.0, " hello world"
+        words = [_Word(" hello", 0.0, 0.5), _Word(" world", 0.5, 1.0)]
+
+    class _Model:
+        def transcribe(self, audio, **kwargs):
+            seen.append(type(audio).__name__)
+            if isinstance(audio, str):
+                # what faster-whisper does with PyAV < 11 installed
+                raise TypeError("open() got an unexpected keyword argument 'metadata_errors'")
+            assert isinstance(audio, np.ndarray)
+            assert audio.dtype == np.float32 and audio.ndim == 1
+            assert kwargs["word_timestamps"] is True and kwargs["vad_filter"] is True
+            return iter([_Seg()]), _Info()
+
+    monkeypatch.setattr(whisper_service, "_get_model", lambda: _Model())
+
+    result = whisper_service.transcribe_audio(str(wav))
+    assert seen == ["str", "ndarray"]  # retried with decoded samples
+    assert result["language"] == "en"
+    assert result["duration"] == 1.0
+    assert result["segments"][0]["word_count"] == 2
+    assert result["segments"][0]["text"] == "hello world"
+
+
+def test_transcribe_audio_reraises_unrelated_type_error(tmp_path, monkeypatch):
+    """TypeErrors not coming from the av.open(metadata_errors) incompatibility
+    must propagate — the fallback must not mask them."""
+    from pathlib import Path as _Path
+
+    wav = tmp_path / "tone.wav"
+    wav.write_bytes(b"RIFF" + b"\0" * 32)
+
+    class _Model:
+        def transcribe(self, audio, **kwargs):
+            raise TypeError("bad argument for some other reason")
+
+    monkeypatch.setattr(whisper_service, "_get_model", lambda: _Model())
+
+    with pytest.raises(TypeError, match="some other reason"):
+        whisper_service.transcribe_audio(str(wav))
