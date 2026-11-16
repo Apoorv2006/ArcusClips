@@ -375,3 +375,223 @@ def test_cancellation_during_download_aborts_and_cleans(public_server, tmp_path)
     exc = result.get("exc")
     assert isinstance(exc, source_scanner.DownloadCancelled)
     assert _dest_files(str(tmp_path)) == []
+
+
+# ---------------------------------------------------------------------------
+# D. Format vetting: storyboard/image-only tracks vs. selected media streams
+# ---------------------------------------------------------------------------
+
+@pytest.fixture()
+def fake_public_dns(monkeypatch):
+    """Hostnames resolve to a public IP; literal IPs resolve for real."""
+    import ipaddress
+    import socket as _s
+
+    real_gai = _s.getaddrinfo
+
+    def fake_gai(host, port, *args, **kwargs):
+        try:
+            ipaddress.ip_address(host)
+            return real_gai(host, port, *args, **kwargs)
+        except ValueError:
+            return [(_s.AF_INET, _s.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    monkeypatch.setattr(_s, "getaddrinfo", fake_gai)
+
+
+def _storyboard_formats():
+    return [
+        {
+            "format_id": f"sb{i}",
+            "format_note": f"storyboard {i + 1}",
+            "ext": "mhtml",
+            "protocol": "mhtml",
+            "vcodec": "none",
+            "acodec": "none",
+            "url": f"https://i.ytimg.com/sb/video/storyboard{i}.jpg?sqp=x",
+            "filesize": 1234,
+        }
+        for i in range(4)
+    ]
+
+
+def _media_formats():
+    video = {
+        "format_id": "137",
+        "ext": "mp4",
+        "protocol": "https",
+        "vcodec": "avc1.640028",
+        "acodec": "none",
+        "url": "https://rr2---sn-abc.googlevideo.com/videoplayback?id=video",
+        "filesize": 1_000_000,
+    }
+    audio = {
+        "format_id": "140",
+        "ext": "m4a",
+        "protocol": "https",
+        "vcodec": "none",
+        "acodec": "mp4a.40.2",
+        "url": "https://rr2---sn-abc.googlevideo.com/videoplayback?id=audio",
+        "filesize": 100_000,
+    }
+    return video, audio
+
+
+def _youtube_like_info():
+    """Mirror a YouTube extraction result *after* the format selector ran:
+    storyboards stay in info['formats'] unused; the merged selection is
+    top-level protocol 'https+https' and the components under
+    'requested_formats'."""
+    video, audio = _media_formats()
+    return {
+        "_type": "video",
+        "id": "abc123",
+        "title": "Some video",
+        "protocol": "https+https",
+        "ext": "mp4",
+        "vcodec": video["vcodec"],
+        "acodec": audio["acodec"],
+        "format": "137+140",
+        "format_id": "137+140",
+        # merged selection: no top-level url (yt-dlp sets it only in the download path)
+        "formats": [video, audio, *_storyboard_formats()],
+        "requested_formats": [dict(video), dict(audio)],
+        "webpage_url": "https://www.youtube.com/watch?v=abc123",
+    }
+
+
+def test_mhtml_not_in_allowed_protocols():
+    assert "mhtml" not in source_scanner._ALLOWED_PROTOCOLS
+
+
+def test_youtube_like_info_with_storyboards_passes_validation(fake_public_dns):
+    info = _youtube_like_info()  # storyboards have protocol=mhtml, not selected
+    source_scanner._vet_extracted_info(info)  # must not raise
+
+
+def test_storyboard_formats_detected_by_metadata():
+    for sb in _storyboard_formats():
+        assert source_scanner._is_storyboard_format(sb)
+    video, audio = _media_formats()
+    assert not source_scanner._is_storyboard_format(video)
+    assert not source_scanner._is_storyboard_format(audio)
+    # storyboard identified by format_note even without the mhtml ext/protocol
+    assert source_scanner._is_storyboard_format(
+        {"format_id": "sb5", "format_note": "Storyboard 5", "ext": "webp",
+         "protocol": "https", "vcodec": "none", "acodec": "none"})
+    # a real webp video must not be treated as a storyboard
+    assert not source_scanner._is_storyboard_format(
+        {"format_id": "1", "ext": "webp", "protocol": "https",
+         "vcodec": "vp9", "acodec": "none", "url": "https://cdn.test/x.webp"})
+
+
+def test_storyboard_only_selection_rejected_as_non_media():
+    info = _youtube_like_info()
+    info["requested_formats"] = [dict(_storyboard_formats()[0])]
+    with pytest.raises(source_scanner.ScanError, match="non-media"):
+        source_scanner._vet_extracted_info(info)
+
+
+def test_selected_unsupported_media_protocol_rejected():
+    info = _youtube_like_info()
+    video = dict(info["requested_formats"][0])
+    video["protocol"] = "rtmp"
+    info["requested_formats"] = [video, info["requested_formats"][1]]
+    with pytest.raises(source_scanner.ScanError, match="Unsupported protocol"):
+        source_scanner._vet_extracted_info(info)
+
+
+@pytest.mark.parametrize("bad_url", [
+    "http://127.0.0.1:8080/secret.mp4",
+    "http://[::1]/secret.mp4",
+    "http://192.168.1.50/secret.mp4",
+    "http://169.254.169.254/meta.mp4",
+])
+def test_selected_media_url_private_or_loopback_rejected(bad_url):
+    info = _youtube_like_info()
+    video = dict(info["requested_formats"][0])
+    video["url"] = bad_url
+    info["requested_formats"] = [video, info["requested_formats"][1]]
+    with pytest.raises(source_scanner.ScanError):
+        source_scanner._vet_extracted_info(info)
+
+
+def test_info_with_no_resolved_stream_rejected():
+    with pytest.raises(source_scanner.ScanError, match="did not resolve"):
+        source_scanner._vet_extracted_info({"_type": "video", "id": "x", "title": "x"})
+
+
+def test_import_with_youtube_like_info_and_storyboards_succeeds(tmp_path, monkeypatch):
+    """The full import path: vetting must pass for a YT-like extraction whose
+    only unsupported entries (mhtml storyboards) are not selected, then the
+    download proceeds through the (fake) guarded path."""
+    import copy
+    from pathlib import Path
+
+    info = _youtube_like_info()
+    writes = []
+
+    class _FakeYdl:
+        def __init__(self, opts, byte_budget=None):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download=False):
+            return copy.deepcopy(info)
+
+        def process_ie_result(self, data, download=True):
+            out = Path(tmp_path) / "Some video [abc123].mp4"
+            out.write_bytes(PAYLOAD)
+            writes.append(out)
+            merged = dict(data)
+            merged["requested_downloads"] = [{"filepath": str(out)}]
+            return merged
+
+    monkeypatch.setattr(ytdlp_guard, "GuardedYoutubeDL", _FakeYdl)
+    monkeypatch.setattr(source_scanner, "validate_public_url", lambda u, allowed=None: u)
+
+    res = source_scanner.import_video_from_url(
+        "https://www.youtube.com/watch?v=abc123", str(tmp_path))
+    assert Path(res["path"]).is_file()
+    assert Path(res["path"]).stat().st_size == len(PAYLOAD)
+    assert len(writes) == 1
+
+
+def test_import_with_selected_unsupported_protocol_fails_before_download(tmp_path, monkeypatch):
+    """An actually selected rtmp stream must abort before any media bytes move."""
+    import copy
+
+    info = _youtube_like_info()
+    info["requested_formats"][0]["protocol"] = "rtmp"
+    writes = []
+
+    class _FakeYdl:
+        def __init__(self, opts, byte_budget=None):
+            self.opts = opts
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def extract_info(self, url, download=False):
+            return copy.deepcopy(info)
+
+        def process_ie_result(self, data, download=True):
+            writes.append(True)
+            return data
+
+    monkeypatch.setattr(ytdlp_guard, "GuardedYoutubeDL", _FakeYdl)
+    monkeypatch.setattr(source_scanner, "validate_public_url", lambda u, allowed=None: u)
+
+    with pytest.raises(source_scanner.ScanError, match="Unsupported protocol"):
+        source_scanner.import_video_from_url(
+            "https://www.youtube.com/watch?v=abc123", str(tmp_path))
+    assert writes == []  # download never started
+    assert _dest_files(str(tmp_path)) == []  # no artifacts left behind

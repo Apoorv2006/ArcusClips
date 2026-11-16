@@ -292,6 +292,50 @@ _ALLOWED_PROTOCOLS = frozenset({
     "f4m", "ism",
 })
 
+# Image/preview container extensions used by storyboard tracks.
+_STORYBOARD_IMAGE_EXTS = frozenset({"mhtml", "webp", "jpg", "jpeg", "png", "gif"})
+
+
+def _is_storyboard_format(fmt: dict) -> bool:
+    """True for storyboard/preview tracks (image-only, no audio/video payload).
+
+    YouTube exposes formats like sb0/sb1/... with ext='mhtml',
+    protocol='mhtml' and format_note='storyboard*'. These are never
+    downloadable media and must not participate in media protocol vetting —
+    but they are recognised by explicit metadata (note/ext/protocol and the
+    audio/video codec flags), never by blindly trusting an unknown protocol.
+    """
+    note = str(fmt.get("format_note") or "").lower()
+    ext = str(fmt.get("ext") or "").lower()
+    protocol = str(fmt.get("protocol") or "").lower()
+    vcodec = str(fmt.get("vcodec") if fmt.get("vcodec") is not None else "").lower()
+    acodec = str(fmt.get("acodec") if fmt.get("acodec") is not None else "").lower()
+    if "storyboard" in note:
+        return True
+    if protocol == "mhtml" or ext == "mhtml":
+        return True
+    if ext in _STORYBOARD_IMAGE_EXTS and vcodec in ("none", "") and acodec in ("none", ""):
+        return True
+    return False
+
+
+def _selected_stream_formats(info: dict[str, Any]) -> list:
+    """The audio/video formats yt-dlp actually selected for download.
+
+    yt-dlp resolves the format selector before anything is fetched: for a
+    merged selection (e.g. bestvideo+bestaudio) the merged dict carries
+    'requested_formats' and it is copied to the top level of the info dict;
+    for a single selection the top-level info dict itself carries the selected
+    format's fields (url/protocol/...). Formats in info['formats'] that are
+    not selected are never fetched and are not media-protocol vetted.
+    """
+    merged = [f for f in info.get("requested_formats") or [] if isinstance(f, dict)]
+    if merged:
+        return merged
+    if info.get("url") or info.get("protocol"):
+        return [info]
+    return []
+
 
 def _snapshot_files(dest_dir) -> set:
     """All regular files under dest_dir (used to detect artifacts created by an attempt)."""
@@ -361,25 +405,36 @@ def _iter_format_urls(info: dict[str, Any]):
 def _vet_extracted_info(info: dict[str, Any]) -> None:
     """Vet everything yt-dlp resolved *before* any media bytes are downloaded.
 
-    Raises ScanError for live streams and for URLs/protocols that cannot be
-    handled by the SSRF-validated native download path.
+    Media protocol validation applies to the formats yt-dlp actually selected
+    for download (the requested/merged audio+video streams), not to every
+    format the extractor happened to expose — storyboard/preview tracks are
+    excluded by metadata. Raises ScanError for live streams and for selected
+    URLs/protocols that cannot be handled by the SSRF-validated native
+    download path.
     """
     if info.get("is_live"):
         raise ScanError(
             "Live streams are not supported for import (they are unbounded in size and duration)"
         )
-    protocols = {info.get("protocol")}
-    for fmt in list(info.get("formats") or []) + list(info.get("requested_formats") or []):
-        if isinstance(fmt, dict):
-            protocols.add(fmt.get("protocol"))
-            if fmt.get("is_live"):
-                raise ScanError(
-                    "Live streams are not supported for import (they are unbounded in size and duration)"
-                )
-    for proto in {p for p in protocols if p}:
-        for sp in str(proto).split("+"):
-            if sp.strip() not in _ALLOWED_PROTOCOLS:
-                raise ScanError(f"Unsupported protocol for import: {sp}")
+    selected = _selected_stream_formats(info)
+    media_selected = [f for f in selected if not _is_storyboard_format(f)]
+    if selected and not media_selected:
+        raise ScanError(
+            "yt-dlp selected only non-media (storyboard/image) formats; "
+            "no audio/video stream to import"
+        )
+    if not selected:
+        raise ScanError("yt-dlp did not resolve a downloadable audio/video stream for this URL")
+    for fmt in media_selected:
+        if fmt.get("is_live"):
+            raise ScanError(
+                "Live streams are not supported for import (they are unbounded in size and duration)"
+            )
+        proto = fmt.get("protocol")
+        if proto:
+            for sp in str(proto).split("+"):
+                if sp.strip() not in _ALLOWED_PROTOCOLS:
+                    raise ScanError(f"Unsupported protocol for import: {sp.strip()}")
     for raw in _iter_format_urls(info):
         if not raw:
             continue
