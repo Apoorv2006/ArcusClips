@@ -17,6 +17,11 @@ google-auth-oauthlib>=1.0
 google-api-python-client>=2.108
 # Local Whisper speech-to-text
 faster-whisper>=1.0.0
+# PyAV: faster-whisper's decode_audio() passes metadata_errors to av.open(),
+# which older PyAV releases (<=10) do not support (TypeError: open() got an
+# unexpected keyword argument 'metadata_errors'). Keep av>=11 explicitly even
+# though it is a transitive dependency of faster-whisper.
+av>=11.0.0
 # Video source connectors
 yt-dlp>=2024.4.9
 # Bundled static FFmpeg binary (used as the ffmpeg/ffprobe engine)
