@@ -163,3 +163,29 @@ def test_cross_user_isolation(app_env, auth_headers, client):
     admin_source_id = r.json()["id"]
     r = client.get(f"/api/sources/{admin_source_id}", headers=other_headers)
     assert r.status_code in (404, 405)
+
+
+def test_dashboard_returns_integer_storage_bytes(client, auth_headers):
+    """Regression: /api/dashboard must return storage_bytes as an int, even
+    when the user has videos (previously summed SQLAlchemy column expressions
+    instead of the rows, producing 500)."""
+    from app.db import get_session_factory
+    from app.models import User, Video
+
+    session = get_session_factory()()
+    try:
+        admin = session.query(User).filter(User.is_admin == True).first()  # noqa: E712
+        session.add(Video(user_id=admin.id, kind="upload", name="a.mp4",
+                          size=1234, status="imported"))
+        session.add(Video(user_id=admin.id, kind="upload", name="b.mp4",
+                          size=5678, status="processed"))
+        session.commit()
+    finally:
+        session.close()
+
+    r = client.get("/api/dashboard", headers=auth_headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["storage_bytes"] == 1234 + 5678
+    assert body["imported_videos"] == 1 + 1  # imported + processed
+    assert body["processed_videos"] == 1

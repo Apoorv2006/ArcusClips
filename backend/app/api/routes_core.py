@@ -5,6 +5,7 @@ import json
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ..auth import get_current_user, login
@@ -169,9 +170,11 @@ def api_dashboard(session: Session = Depends(get_db), user: User = Depends(get_c
     total_videos = session.query(Video).filter(Video.user_id == user.id).count()
     imported = _count(Video, status="imported") + _count(Video, status="processed")
     processed = _count(Video, status="processed")
-    storage_bytes = sum(
-        (Video.size or 0)
-        for v in session.query(Video).filter(Video.user_id == user.id).all()
+    storage_bytes = int(
+        session.query(func.coalesce(func.sum(Video.size), 0))
+        .filter(Video.user_id == user.id)
+        .scalar()
+        or 0
     )
     active_batches = _count(Batch, status="queued") + _count(Batch, status="processing")
     if active_batches == 0:
