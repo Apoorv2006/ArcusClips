@@ -13,6 +13,7 @@ import os
 import re
 import shutil
 import subprocess
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -85,9 +86,24 @@ def ffmpeg_version() -> str:
         return f"error: {exc}"
 
 
-def _run(cmd: list[str], timeout: float | None = None) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], timeout: float | None = None, cwd: str | None = None) -> subprocess.CompletedProcess:
     logger.debug("Running: %s", " ".join(cmd))
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+
+
+def _filter_path(path: str) -> str:
+    """Escape an absolute path for embedding in a filtergraph option value.
+
+    FFmpeg parses filter arguments with ':' as the option separator and '\\' as
+    an escape character, so unquoted Windows paths ('C:\\Users\\...') break the
+    ass/subtitles filters ('C' becomes the filename). Forward slashes avoid
+    backslash escaping entirely; the drive-letter colon is escaped and the value
+    is single-quoted so spaces, commas and emoji pass through.
+    """
+    s = str(path).replace("\\", "/")
+    s = s.replace(":", r"\:").replace("'", r"\'")
+    return f"'{s}'"
+
 
 
 # ---------------------------------------------------------------------------
@@ -443,15 +459,19 @@ def render_clip(
 
     workdir = Path(out_path).parent
     workdir.mkdir(parents=True, exist_ok=True)
-    ass_path = str(workdir / f".captions_{Path(out_path).stem}.ass")
+    # Unique caption sidecar name with no path separators/colons/spaces: ffmpeg
+    # runs with cwd=workdir and references it by basename, so the filtergraph
+    # never carries an absolute path (see _filter_path for why that matters).
+    ass_name = f".captions_{uuid.uuid4().hex}.ass"
+    ass_path = workdir / ass_name
     if words:
-        generate_ass(ass_path, words, style, handle=handle, hook=hook)
+        generate_ass(str(ass_path), words, style, handle=handle, hook=hook)
 
     # Single filter_complex chain: layout -> burned-in ASS captions, output [v]
     fc = _layout_filter(layout, media.width, media.height)
     fonts = _fontsdir()
     if words:
-        ass_arg = f"ass={ass_path}" + (f":fontsdir={fonts}" if fonts else "")
+        ass_arg = f"ass={ass_name}" + (f":fontsdir={_filter_path(fonts)}" if fonts else "")
         if layout == "blur":
             fc = fc.replace(
                 "[bg][fg]overlay=(W-w)/2:(H-h)/2",
@@ -480,7 +500,7 @@ def render_clip(
         out_path,
     ]
 
-    proc = _run(cmd, timeout=timeout)
+    proc = _run(cmd, timeout=timeout, cwd=str(workdir))
     if proc.returncode != 0:
         err = proc.stderr[-800:]
         if Path(out_path).exists():
