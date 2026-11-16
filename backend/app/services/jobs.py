@@ -36,6 +36,19 @@ def log_event(session: Session, user_id: int | None, level: str, message: str,
     session.add(Event(user_id=user_id, level=level, source=source, message=message[:1000]))
 
 
+def _checkpoint(session: Session) -> None:
+    """Commit the current transaction and release the SQLite write lock.
+
+    The worker holds one session for the whole lifetime of a job, and SQLite
+    allows only one writer at a time. Committing at phase boundaries keeps the
+    write lock held for milliseconds instead of the minutes a download or
+    render can take — otherwise API writes (pause/cancel/create batch) block
+    on the busy timeout and fail with 'database is locked'. get_session_factory
+    uses expire_on_commit=False, so callers keep using their instances.
+    """
+    session.commit()
+
+
 def _update_job(session: Session, job: Job, status: str | None = None,
                 stage: str | None = None, progress: float | None = None,
                 error: str | None = None) -> None:
@@ -50,7 +63,7 @@ def _update_job(session: Session, job: Job, status: str | None = None,
     if error is not None:
         job.error = error[:4000]
     job.heartbeat_at = utcnow()
-    session.flush()
+    _checkpoint(session)
 
 
 def compute_batch_status(session: Session, batch: Batch) -> None:
@@ -289,7 +302,7 @@ def ensure_video_imported(session: Session, user_id: int, video: Video, job: Job
         video.imported_at = utcnow()
         if df:
             df.import_status = "imported"
-        session.flush()
+        _checkpoint(session)
     elif video.kind in ("url", "page"):
         from . import source_scanner
 
@@ -304,7 +317,7 @@ def ensure_video_imported(session: Session, user_id: int, video: Video, job: Job
         video.status = "imported"
         video.status_detail = "Downloaded from URL"
         video.imported_at = utcnow()
-        session.flush()
+        _checkpoint(session)
     else:
         raise RuntimeError(f"Cannot import video of kind '{video.kind}'")
     return video
@@ -352,7 +365,7 @@ def run_video_job(job: Job, session: Session, render_semaphore: threading.Semaph
         video.has_audio = media.has_audio
         video.size = media.size
         video.media_valid = True
-        session.flush()
+        _checkpoint(session)
 
         # Transcription
         transcript = session.query(Transcript).filter(Transcript.video_id == video.id).first()
@@ -364,7 +377,7 @@ def run_video_job(job: Job, session: Session, render_semaphore: threading.Semaph
             def _tcb(p: float, m: str) -> None:
                 job.progress = 0.3 + 0.35 * p
                 job.heartbeat_at = utcnow()
-                session.flush()
+                _checkpoint(session)
 
             if not media.has_audio:
                 segments = [{"start": 0.0, "end": media.duration, "text": "", "words": [], "word_count": 0}]
@@ -429,16 +442,16 @@ def run_video_job(job: Job, session: Session, render_semaphore: threading.Semaph
                 is_heuristic=is_heuristic,
             )
             session.add(clip)
-            session.flush()
+            _checkpoint(session)
 
             with render_semaphore:
                 _render_clip_record(session, clip, video, cand, handle, job, idx, len(candidates))
             clip.status = "rendered" if clip.current_version else "failed"
-            session.flush()
+            _checkpoint(session)
 
         video.status = "processed"
         video.status_detail = f"{len(candidates)} clips generated"
-        session.flush()
+        _checkpoint(session)
         _update_job(session, job, status="done", stage="done", progress=1.0)
         if job.batch:
             compute_batch_status(session, job.batch)
@@ -478,14 +491,14 @@ def _render_clip_record(session: Session, clip: Clip, video: Video, cand: dict[s
 
     job.progress = 0.8 + 0.2 * (idx / max(total, 1))
     job.heartbeat_at = utcnow()
-    session.flush()
+    _checkpoint(session)
 
     ver = ClipVersion(
         clip_id=clip.id, user_id=clip.user_id, version=version,
         status="rendering",
     )
     session.add(ver)
-    session.flush()
+    _checkpoint(session)
     try:
         result = ffmpeg_engine.render_clip(
             video.local_path, clip.start_time, clip.end_time, str(out_path),
@@ -506,11 +519,11 @@ def _render_clip_record(session: Session, clip: Clip, video: Video, cand: dict[s
             ver.thumbnail_path = str(thumb)
         except Exception:
             pass  # thumbnail is best-effort
-        session.flush()
+        _checkpoint(session)
     except Exception as exc:
         ver.status = "failed"
         ver.error = str(exc)[:2000]
-        session.flush()
+        _checkpoint(session)
         raise
 
 

@@ -237,3 +237,108 @@ def test_transcribe_endpoint_with_stub(client, auth_headers, uploaded_video, stu
     # transcript persisted: second call still works (and would be reused by batches)
     r = client.get(f"/api/videos/{uploaded_video['id']}/transcript", headers=auth_headers)
     assert r.status_code == 200
+
+
+def test_job_releases_db_write_lock_during_long_phases(client, auth_headers, uploaded_video, monkeypatch):
+    """Regression: a batch job must not hold the SQLite write transaction open
+    during long-running phases (import/ffprobe/transcription/render) — API
+    writes (pause/cancel/create batch) used to block on the busy timeout and
+    fail with 'database is locked'."""
+    import threading
+    import types
+
+    import pytest  # noqa: F401  (fixture style kept consistent with module)
+
+    from app.db import get_session_factory
+    from app.models import Batch, Job, User, Video
+    from app.services import jobs, ffmpeg_engine, selection, whisper_service
+
+    session = get_session_factory()()
+    try:
+        admin = session.query(User).filter(User.is_admin == True).first()  # noqa: E712
+        vid = uploaded_video["id"]
+        batch = Batch(user_id=admin.id, name="lock-test", status="processing",
+                      options={"clips_per_video": 2, "duration": {"min_seconds": 8, "max_seconds": 12},
+                               "caption_style": "bounce", "layout": "blur",
+                               "creator_handle": "", "quality": "balanced"},
+                      total_videos=1)
+        session.add(batch)
+        session.flush()
+        job = Job(user_id=admin.id, batch_id=batch.id, video_id=vid, kind="render",
+                  status="running", stage="importing", progress=0.0, payload={})
+        session.add(job)
+        session.commit()
+        job_id, batch_id = job.id, batch.id
+    finally:
+        session.close()
+
+    locks: list[tuple[str, bool]] = []
+
+    def _lock(name, sess):
+        locks.append((name, sess.in_transaction()))
+
+    def fake_import(sess, user_id, video, job=None, progress_cb=None, cancel_event=None):
+        _lock("import", sess)
+        # keep the uploaded file: run_video_job md5-hashes local_path before transcription
+        assert video.local_path and Path(video.local_path).exists()
+        video.status = "imported"
+        return video
+
+    def fake_probe(path):
+        _lock("ffprobe", probe_session[0])
+        return types.SimpleNamespace(valid=True, duration=60.0, width=1280, height=720,
+                                     has_audio=True, size=1000, detail="")
+
+    probe_session = [None]
+
+    def fake_transcribe(video_path, wav_path, progress_cb=None, language=None):
+        _lock("transcribe", probe_session[0])
+        if progress_cb:
+            progress_cb(1.0, "done")
+        return {"language": "en", "duration": 60.0, "segments": FAKE_SEGMENTS, "model": "stub"}
+
+    def fake_select(*args, **kwargs):
+        _lock("selection", probe_session[0])
+        return {"candidates": [
+                    {"start": 0.0, "end": 8.0, "score": 0.9, "hook": "h1", "title": "t1",
+                     "description": "d1", "category": "c", "reason": "r"},
+                    {"start": 9.0, "end": 16.0, "score": 0.8, "hook": "h2", "title": "t2",
+                     "description": "d2", "category": "c", "reason": "r"},
+                ],
+                "source": "heuristic", "error": ""}
+
+    def fake_render(video_path, start, end, out, **kwargs):
+        _lock("render", probe_session[0])
+        Path(out).parent.mkdir(parents=True, exist_ok=True)
+        Path(out).write_bytes(b"fake-mp4")
+        return {"ok": True, "render_path": str(out), "duration": end - start, "size": 8}
+
+    def fake_thumb(video_path, at, out):
+        Path(out).write_bytes(b"jpg")
+
+    monkeypatch.setattr(jobs, "ensure_video_imported", fake_import)
+    monkeypatch.setattr(ffmpeg_engine, "probe", lambda path: fake_probe(path))
+    monkeypatch.setattr(whisper_service, "transcribe_video_file", fake_transcribe)
+    monkeypatch.setattr(selection, "select_moments", fake_select)
+    monkeypatch.setattr(ffmpeg_engine, "render_clip", fake_render)
+    monkeypatch.setattr(ffmpeg_engine, "make_thumbnail", fake_thumb)
+
+    session = get_session_factory()()
+    probe_session[0] = session
+    try:
+        job = session.get(Job, job_id)
+        jobs.run_video_job(job, session, threading.Semaphore(1), cancel_check=lambda: False)
+        session.commit()
+        assert job.status == "done"
+    finally:
+        session.close()
+
+    assert locks, "no phase hooks ran"
+    assert not any(held for _, held in locks), locks
+    # batch aggregate was recomputed and committed
+    session = get_session_factory()()
+    try:
+        batch = session.get(Batch, batch_id)
+        assert batch.completed_videos == 1
+    finally:
+        session.close()
